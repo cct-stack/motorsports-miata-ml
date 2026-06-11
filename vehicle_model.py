@@ -38,6 +38,26 @@ class NCMiata:
         # Swap in real TTC/Calspan-fit coefficients via PacejkaTire.fit_from_raw
         # or PacejkaTire.from_dict when you have measured data.
         self.tire = PacejkaTire.re71rs()
+        self.tyre_radius = 0.306    # m (205/50R16 rolling radius)
+        self.Cr = 0.015             # rolling resistance coefficient
+
+        # --- Engine / Drivetrain (NC2 2.0L MZR, 6-speed) ---
+        # Torque curve (rpm, Nm) at the crank. Peak power ~125 kW @ 7000 rpm.
+        self.torque_curve = [
+            (1000, 130), (2000, 160), (3000, 176), (4000, 184),
+            (5000, 188), (6000, 182), (7000, 170), (7500, 150), (7750, 120),
+        ]
+        self.gear_ratios  = [3.136, 1.888, 1.330, 1.000, 0.814, 0.657]
+        self.final_drive  = 4.10
+        self.primary_ratio = 1.0
+        self.primary_eff  = 1.0
+        self.gear_eff     = 0.97
+        self.final_eff    = 0.97
+        self.shift_time   = 0.2     # s (unused by the QSS solver, kept for export)
+
+        # Tractive-force-vs-speed lookup (built from torque curve + gearing),
+        # so the lap solver does not redo the gear optimisation every step.
+        self._build_engine_curve()
 
     def get_static_loads(self):
         """Returns static vertical load [F, R] in Newtons."""
@@ -103,3 +123,72 @@ class NCMiata:
             ay = ay_new
 
         return ay
+
+    # ------------------------------------------------------------------ #
+    # Longitudinal performance (acceleration / braking)
+    # ------------------------------------------------------------------ #
+    def _build_engine_curve(self, v_top=95.0, n=400):
+        """Precompute max tractive force at the wheels vs. vehicle speed.
+
+        For each speed, the best gear is the one giving the highest wheel
+        force without over-revving the engine (same logic as OpenVEHICLE's
+        driveline model). Below the torque curve's lowest rpm we clamp to it
+        (launch). Result is cached as a (v_grid, F_grid) lookup table.
+        """
+        rpm_pts = np.array([p[0] for p in self.torque_curve], dtype=float)
+        tq_pts  = np.array([p[1] for p in self.torque_curve], dtype=float)
+        rpm_min, rpm_max = rpm_pts[0], rpm_pts[-1]
+        eff = self.primary_eff * self.gear_eff * self.final_eff
+
+        v_grid = np.linspace(0.1, v_top, n)
+        F_grid = np.zeros_like(v_grid)
+        for k, v in enumerate(v_grid):
+            best = 0.0
+            for ratio in self.gear_ratios:
+                total = ratio * self.final_drive * self.primary_ratio
+                rpm = v / self.tyre_radius * total * 60.0 / (2.0 * np.pi)
+                if rpm > rpm_max:
+                    continue  # would over-rev in this gear
+                tq = np.interp(max(rpm, rpm_min), rpm_pts, tq_pts)
+                f_wheel = tq * total * eff / self.tyre_radius
+                if f_wheel > best:
+                    best = f_wheel
+            F_grid[k] = best
+        self._v_grid = v_grid
+        self._F_grid = F_grid
+
+    def tractive_force(self, v):
+        """Max engine tractive force at the driven wheels (N) at speed v."""
+        return float(np.interp(abs(v), self._v_grid, self._F_grid))
+
+    def drag_force(self, v):
+        """Aerodynamic drag force (N)."""
+        return 0.5 * self.rho * self.cd_a * v * v
+
+    def rolling_resistance(self):
+        """Rolling resistance force (N)."""
+        return self.Cr * self.mass * 9.81
+
+    def get_max_long_accel(self, v, ay, ay_max):
+        """Max forward acceleration (m/s^2) at speed v while using lateral
+        acceleration ay. Couples lateral and longitudinal grip with a friction
+        circle, then takes the lesser of tyre-limited and engine-limited drive,
+        minus drag and rolling resistance."""
+        if ay_max <= 0.0:
+            return 0.0
+        frac = np.sqrt(max(1.0 - min(ay / ay_max, 1.0) ** 2, 0.0))
+        ax_tyre   = ay_max * frac
+        ax_engine = self.tractive_force(v) / self.mass
+        ax = min(ax_engine, ax_tyre)
+        ax -= (self.drag_force(v) + self.rolling_resistance()) / self.mass
+        return ax
+
+    def get_max_decel(self, v, ay, ay_max):
+        """Max braking deceleration (m/s^2, positive) at speed v while using
+        lateral acceleration ay. All four tyres brake (friction circle); drag
+        and rolling resistance assist."""
+        if ay_max <= 0.0:
+            ay_max = 1e-6
+        frac = np.sqrt(max(1.0 - min(ay / ay_max, 1.0) ** 2, 0.0))
+        ax_tyre = ay_max * frac
+        return ax_tyre + (self.drag_force(v) + self.rolling_resistance()) / self.mass

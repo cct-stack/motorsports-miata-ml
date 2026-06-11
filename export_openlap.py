@@ -45,34 +45,8 @@ def _row(ws, row, label, value, unit=""):
         ws.cell(row=row, column=3, value=unit)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Engine / drivetrain data for a 2.0L NC2 Miata (approximately)
-# ─────────────────────────────────────────────────────────────────────────────
-
-NC2_TORQUE_CURVE = [
-    # (rpm,  Nm)
-    (1000,  130),
-    (2000,  160),
-    (3000,  176),
-    (4000,  184),
-    (5000,  188),
-    (6000,  182),
-    (7000,  170),
-    (7500,  150),
-    (7750,  120),
-]
-
-# NC 6-speed manual (approximate OEM ratios)
-NC2_GEARBOX_RATIOS = [3.136, 1.888, 1.330, 1.000, 0.814, 0.657]
-NC2_PRIMARY_RATIO  = 1.0
-NC2_FINAL_RATIO    = 4.10
-NC2_GEAR_EFF       = 0.97     # per-gear efficiency
-NC2_FINAL_EFF      = 0.97
-NC2_PRIMARY_EFF    = 1.0
-NC2_SHIFT_TIME     = 0.2      # [s]
-
-# 205/50R16 tyre geometry (RE-71RS common NC fitment)
-TYRE_RADIUS_MM = 306.0   # (16*25.4/2) + 205*0.50  = 203.2 + 102.5 = 305.7 ≈ 306
+# Engine / drivetrain constants are sourced from NCMiata in vehicle_model.py.
+# TYRE_RADIUS_MM is derived from vehicle.tyre_radius at export time.
 
 # Brakes – typical Miata (Wilwood or OEM upgraded)
 BRAKE_DISC_D_MM  = 270.0   # front disc diameter
@@ -155,8 +129,8 @@ def export_vehicle(vehicle: NCMiata, path: str = "NC_Miata_OpenVEHICLE.xlsx"):
         ("br_mast_d",                        BRAKE_MAST_D_MM,           "mm"),
         ("br_ped_r",                         BRAKE_PED_RATIO,           "-"),
         ("factor_grip",                      1.0,                       "-"),
-        ("tyre_radius",                      TYRE_RADIUS_MM,            "mm"),
-        ("Cr",                               0.015,                     "-"),
+        ("tyre_radius",                      round(vehicle.tyre_radius * 1000, 1), "mm"),
+        ("Cr",                               vehicle.Cr,                "-"),
         ("mu_x",                             round(mu_x, 4),            "-"),
         ("mu_x_M",                           round(mu_x_M, 2),          "1/kg"),
         ("sens_x",                           round(sens_x, 6),          "-"),
@@ -169,19 +143,19 @@ def export_vehicle(vehicle: NCMiata, path: str = "NC_Miata_OpenVEHICLE.xlsx"):
         ("n_thermal",                        1.0,                       "-"),
         ("fuel_LHV",                         43.4e6,                    "J/kg"),
         ("drive",                            "RWD",                     "-"),
-        ("shift_time",                       NC2_SHIFT_TIME,            "s"),
-        ("n_primary",                        NC2_PRIMARY_EFF,           "-"),
-        ("n_final",                          NC2_FINAL_EFF,             "-"),
-        ("n_gearbox",                        NC2_GEAR_EFF,              "-"),
-        ("ratio_primary",                    NC2_PRIMARY_RATIO,         "-"),
-        ("ratio_final",                      NC2_FINAL_RATIO,           "-"),
+        ("shift_time",                       vehicle.shift_time,        "s"),
+        ("n_primary",                        vehicle.primary_eff,       "-"),
+        ("n_final",                          vehicle.final_eff,         "-"),
+        ("n_gearbox",                        vehicle.gear_eff,          "-"),
+        ("ratio_primary",                    vehicle.primary_ratio,     "-"),
+        ("ratio_final",                      vehicle.final_drive,       "-"),
     ]
     for i, (lbl, val, unit) in enumerate(rows, start=2):
         _row(ws, i, lbl, val, unit)
 
     # Gear ratios – one per row after the fixed rows
     r_start = 2 + len(rows)
-    for g, ratio in enumerate(NC2_GEARBOX_RATIOS, start=1):
+    for g, ratio in enumerate(vehicle.gear_ratios, start=1):
         _row(ws, r_start, f"ratio_gearbox_gear{g}", ratio, "-")
         r_start += 1
 
@@ -189,7 +163,7 @@ def export_vehicle(vehicle: NCMiata, path: str = "NC_Miata_OpenVEHICLE.xlsx"):
     ws2 = wb.create_sheet("Torque Curve")
     ws2.cell(row=1, column=1, value="Engine_Speed_rpm").font = Font(bold=True)
     ws2.cell(row=1, column=2, value="Torque_Nm").font = Font(bold=True)
-    for i, (rpm, nm) in enumerate(NC2_TORQUE_CURVE, start=2):
+    for i, (rpm, nm) in enumerate(vehicle.torque_curve, start=2):
         ws2.cell(row=i, column=1, value=rpm)
         ws2.cell(row=i, column=2, value=nm)
 
@@ -311,3 +285,24 @@ if __name__ == "__main__":
     print("    Lap time estimate = 2*pi*30 / 20.87 ≈ 9.03 s")
     print("    (OpenLAP will be close to this; our GP-optimised result of 9.65 s")
     print("     reflects load-transfer penalty from our suspension model.)")
+
+    # ── Monza comparison (full track, braking + acceleration) ────────────────
+    print()
+    print("=" * 60)
+    print("Monza comparison (longitudinal dynamics)")
+    print("=" * 60)
+    from track import Track
+    from simulator import LapSimulator
+    monza = Track.monza()
+    t_monza, v_monza = LapSimulator(car, monza).solve()
+    print(f"Python sim on Monza: {t_monza:6.2f} s "
+          f"({int(t_monza // 60)}:{t_monza % 60:05.2f})  "
+          f"v_max = {v_monza.max() * 3.6:.0f} km/h")
+    print()
+    print("To compare in OpenLAP, no track export is needed — our Monza is read")
+    print("directly from OpenLAP's own 'Autodromo Nazionale Monza.xlsx', so both")
+    print("simulators run identical geometry. In MATLAB:")
+    print("  1. Run OpenVEHICLE.m with filename = 'NC_Miata_OpenVEHICLE.xlsx'")
+    print("  2. Run OpenTRACK.m   with filename = 'Autodromo Nazionale Monza.xlsx'")
+    print("                            mode     = 'shape data'")
+    print("  3. Run OpenLAP.m on those two .mat files; compare lap time + trace.")
