@@ -1,4 +1,5 @@
 import numpy as np
+from tire_model import PacejkaTire
 
 class NCMiata:
     """
@@ -31,6 +32,13 @@ class NCMiata:
         self.power_max = 125000     # Watts (~167 hp)
         self.efficiency = 0.85      # Drivetrain efficiency
 
+        # --- Tire ---
+        # Pacejka Magic Formula tire. Default is the Bridgestone RE-71RS preset
+        # (the tire currently on the car), shaped to its documented behavior.
+        # Swap in real TTC/Calspan-fit coefficients via PacejkaTire.fit_from_raw
+        # or PacejkaTire.from_dict when you have measured data.
+        self.tire = PacejkaTire.re71rs()
+
     def get_static_loads(self):
         """Returns static vertical load [F, R] in Newtons."""
         g = 9.81
@@ -44,14 +52,11 @@ class NCMiata:
 
     def tire_model(self, vertical_load):
         """
-        Simplified tire model with load sensitivity.
-        Returns peak friction coefficient (mu).
-        mu = mu_max * (1 - sensitivity * load)
+        Peak friction coefficient (mu) at a given vertical load.
+        Delegates to the Pacejka Magic Formula tire, which captures real,
+        nonlinear load sensitivity (peak mu falls as the tire is overloaded).
         """
-        mu_max = 1.3
-        sensitivity = 0.00005 # per Newton
-        mu = mu_max * (1 - sensitivity * vertical_load)
-        return max(0.1, mu)
+        return float(self.tire.peak_mu(vertical_load))
 
     def get_max_lat_accel(self, velocity):
         """
