@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miata-sim"
+version = "0.1.0"
+description = "NC Miata quasi-steady-state lap-time simulation, DoE/GP surrogate optimization, and OpenLAP export."
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+# Run from the repo root; the flat modules (vehicle_model, simulator, ...)
+# live there, so put the root on sys.path for the tests/ package.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

@@ -15,8 +15,10 @@ import os
 import numpy as np
 import optuna
 import pandas as pd
+from dataclasses import replace
 from pathlib import Path
 
+from config import VehicleConfig
 from doe_sampler import run_lhs_sweep, PARAM_NAMES, LOWER, UPPER
 from surrogate import LapTimeSurrogate
 from vehicle_model import NCMiata
@@ -25,11 +27,15 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def build_pipeline(n_doe_samples: int = 200, surrogate_path: str = "surrogate.pkl",
-                   doe_path: str = "doe_results.csv", force_retrain: bool = False):
+                   doe_path: str = "doe_results.csv", force_retrain: bool = False,
+                   base_cfg: VehicleConfig = None):
     """Run stages 1 and 2 if not already cached."""
+    if base_cfg is None:
+        base_cfg = VehicleConfig()
+
     if not Path(doe_path).exists() or force_retrain:
         print("Stage 1: Running DoE (Latin Hypercube Sampling)...")
-        df = run_lhs_sweep(n_samples=n_doe_samples)
+        df = run_lhs_sweep(n_samples=n_doe_samples, base_cfg=base_cfg)
         df.to_csv(doe_path, index=False)
     else:
         print(f"Stage 1: Loading cached DoE results from {doe_path}")
@@ -65,7 +71,11 @@ def make_objective(surrogate: LapTimeSurrogate):
     return objective
 
 
-def run_optimization(surrogate: LapTimeSurrogate, n_trials: int = 2000):
+def run_optimization(surrogate: LapTimeSurrogate, n_trials: int = 2000,
+                     base_cfg: VehicleConfig = None):
+    if base_cfg is None:
+        base_cfg = VehicleConfig()
+
     print(f"\nStage 3: Bayesian Optimization ({n_trials} surrogate queries)...")
     study = optuna.create_study(
         direction="minimize",
@@ -80,14 +90,11 @@ def run_optimization(surrogate: LapTimeSurrogate, n_trials: int = 2000):
     print(f"  Front ARB:    {best['arb_k_f']/10000:.2f} kg/mm equiv")
     print(f"  Rear ARB:     {best['arb_k_r']/10000:.2f} kg/mm equiv")
 
-    # Verify with actual simulator (not surrogate)
+    # Verify with actual simulator (not surrogate), using the loaded car's base params
     from track import Track
     from simulator import LapSimulator
-    car = NCMiata()
-    car.spring_k_f = best["spring_k_f"]
-    car.spring_k_r = best["spring_k_r"]
-    car.arb_k_f    = best["arb_k_f"]
-    car.arb_k_r    = best["arb_k_r"]
+    opt_cfg = replace(base_cfg, **{k: best[k] for k in PARAM_NAMES})
+    car = NCMiata(opt_cfg)
     sim = LapSimulator(car, Track())
     actual_time, _ = sim.solve()
     print(f"\n  Surrogate predicted: {study.best_value:.3f}s")

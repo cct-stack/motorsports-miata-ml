@@ -1,6 +1,8 @@
+from typing import Tuple
+
 import numpy as np
-from vehicle_model import NCMiata
-from track import Track
+
+from interfaces import TrackModel, VehicleModel
 
 
 class LapSimulator:
@@ -12,23 +14,41 @@ class LapSimulator:
     final speed at each point is the minimum the car can satisfy in both
     directions. Longitudinal and lateral grip are coupled with a friction
     circle inside the vehicle model.
+
+    The solver depends only on the ``VehicleModel`` / ``TrackModel`` protocols
+    (see interfaces.py), so any compatible vehicle or track can be simulated.
     """
 
-    def __init__(self, vehicle: NCMiata, track: Track, v_cap=100.0):
+    def __init__(self, vehicle: VehicleModel, track: TrackModel,
+                 v_cap: float = 100.0):
         self.vehicle = vehicle
         self.track = track
         self.v_cap = v_cap  # upper bound on straight-line speed search [m/s]
 
     # ------------------------------------------------------------------ #
-    def _corner_speed_limit(self, ay_max):
-        """Max speed at each point from pure lateral grip: v = sqrt(ay_max/kappa).
-        On near-straight sections (kappa ~ 0) the limit is the search cap."""
-        kappa = np.abs(self.track.curvature)
-        with np.errstate(divide="ignore"):
-            v = np.sqrt(ay_max / np.maximum(kappa, 1e-9))
-        return np.minimum(v, self.v_cap)
+    def _corner_speed_limit(self) -> np.ndarray:
+        """Max speed at each point from pure lateral grip.
 
-    def _segment_lengths(self):
+        Solves the implicit relation v = sqrt(ay_max(v)/kappa): with aero
+        downforce the grip limit ay_max rises with speed, so the cornering
+        speed and the grip it relies on are mutually dependent. A few
+        fixed-point iterations (vectorised through the cached grip curve)
+        converge quickly. With no downforce ay_max is constant and this
+        reduces to the single-shot v = sqrt(ay_max/kappa). On near-straight
+        sections (kappa ~ 0) the limit is the search cap."""
+        kappa = np.maximum(np.abs(self.track.curvature), 1e-9)
+        ay = self.vehicle.max_lat_accel(0.0)
+        v = np.minimum(np.sqrt(ay / kappa), self.v_cap)
+        for _ in range(8):
+            v_new = np.minimum(np.sqrt(self.vehicle.max_lat_accel(v) / kappa),
+                               self.v_cap)
+            if np.max(np.abs(v_new - v)) < 1e-3:
+                v = v_new
+                break
+            v = v_new
+        return v
+
+    def _segment_lengths(self) -> np.ndarray:
         """Distance to the previous point at each index. For a closed track the
         first entry wraps around from the last point."""
         ds = np.diff(self.track.s)
@@ -39,12 +59,14 @@ class LapSimulator:
             ds = np.concatenate(([ds[0]], ds))
         return ds
 
-    def solve(self):
+    def solve(self) -> Tuple[float, np.ndarray]:
         """Return (lap_time [s], speed_profile [m/s] at each track point)."""
-        v_corner = self._corner_speed_limit(self.vehicle.get_max_lat_accel(0.0))
+        # Build the speed-dependent grip curve up front so it reflects the
+        # current setup/aero, then look up ay_max(v) at each point.
+        self.vehicle.build_grip_curve(v_top=self.v_cap)
+        v_corner = self._corner_speed_limit()
         ds = self._segment_lengths()
         n = len(v_corner)
-        ay_max = self.vehicle.get_max_lat_accel(0.0)
         closed = self.track.config == "Closed"
 
         v = v_corner.copy()
@@ -58,6 +80,7 @@ class LapSimulator:
                     continue
                 vp = v[j]
                 ay = vp * vp * abs(self.track.curvature[j])
+                ay_max = self.vehicle.max_lat_accel(vp)
                 ax = self.vehicle.get_max_long_accel(vp, ay, ay_max)
                 # Integrate forward. ax may be negative when aero drag exceeds
                 # available thrust (above the engine/drag equilibrium speed),
@@ -73,6 +96,7 @@ class LapSimulator:
                     continue
                 vn = v[j]
                 ay = vn * vn * abs(self.track.curvature[j])
+                ay_max = self.vehicle.max_lat_accel(vn)
                 ax = self.vehicle.get_max_decel(vn, ay, ay_max)
                 v_reach = np.sqrt(vn * vn + 2.0 * ax * ds[j])
                 v[i] = min(v[i], v_reach)
@@ -89,6 +113,9 @@ class LapSimulator:
 
 
 if __name__ == "__main__":
+    from vehicle_model import NCMiata
+    from track import Track
+
     car = NCMiata()
 
     for track in (Track(), Track.monza()):

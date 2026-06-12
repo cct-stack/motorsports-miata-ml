@@ -1,0 +1,144 @@
+"""Setup-comparison analysis and plots.
+
+Turns the raw output of :class:`simulator.LapSimulator` (a lap time plus a
+speed profile at every track point) into the telemetry-style comparisons an
+engineer actually reads: a speed-trace overlay, a cumulative time-delta trace
+(where on the lap one setup gains or loses time vs another), and a lap-time
+bar chart with a min/max-speed summary.
+
+The module never selects a Matplotlib backend itself, so the caller decides
+whether to pop up interactive windows (``run_pipeline.py``) or render head-
+less to PNG (the test-suite uses the ``Agg`` backend).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Sequence
+
+import numpy as np
+
+
+@dataclass
+class LapResult:
+    """One simulated lap, ready to plot/compare.
+
+    Build with :meth:`from_sim` so the cumulative-time integration matches the
+    simulator's own segment lengths exactly (single source of truth).
+    """
+
+    label: str          # e.g. "Baseline" / "Optimized"
+    track_name: str
+    s: np.ndarray       # distance along the lap [m]
+    v: np.ndarray       # speed at each point [m/s]
+    ds: np.ndarray      # segment length ending at each point [m]
+    lap_time: float     # total lap time [s]
+    closed: bool        # closed loop vs point-to-point
+
+    @classmethod
+    def from_sim(cls, label: str, sim) -> "LapResult":
+        lap_time, v = sim.solve()
+        ds = sim._segment_lengths()
+        track = sim.track
+        return cls(label, track.name, np.asarray(track.s, float), v, ds,
+                   float(lap_time), track.config == "Closed")
+
+    # --- derived quantities ------------------------------------------- #
+    @property
+    def v_kph(self) -> np.ndarray:
+        return self.v * 3.6
+
+    @property
+    def v_min(self) -> float:
+        return float(self.v.min())
+
+    @property
+    def v_max(self) -> float:
+        return float(self.v.max())
+
+    @property
+    def cum_time(self) -> np.ndarray:
+        """Elapsed time at each point, integrated like the solver does:
+        ``dt[i] = ds[i] / mean(v[i-1], v[i])`` then a running sum."""
+        v_prev = np.roll(self.v, 1)
+        if not self.closed:
+            v_prev[0] = self.v[0]
+        v_avg = np.maximum(0.5 * (self.v + v_prev), 1e-3)
+        return np.cumsum(self.ds / v_avg)
+
+
+def time_delta(baseline: LapResult, optimized: LapResult) -> np.ndarray:
+    """Cumulative time gained/lost by *optimized* vs *baseline* at each point.
+    Negative => optimized is ahead (faster). Both must share the track mesh."""
+    return optimized.cum_time - baseline.cum_time
+
+
+def summary(results: Sequence[LapResult]) -> List[Dict[str, float]]:
+    """Per-setup headline metrics (lap time, min/max speed)."""
+    return [
+        {
+            "label": r.label,
+            "track": r.track_name,
+            "lap_time": r.lap_time,
+            "v_min_kph": r.v_min * 3.6,
+            "v_max_kph": r.v_max * 3.6,
+        }
+        for r in results
+    ]
+
+
+def compare_figure(baseline: LapResult, optimized: LapResult):
+    """Two-panel comparison for a single track.
+
+    Top: speed (km/h) vs distance for both setups, with the slowest point of
+    each marked. Bottom: cumulative time-delta vs distance (optimized minus
+    baseline). Returns the Matplotlib ``Figure``.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, (ax_v, ax_d) = plt.subplots(
+        2, 1, figsize=(11, 7), sharex=True,
+        gridspec_kw={"height_ratios": [2, 1]})
+    fig.suptitle(f"{baseline.track_name}  -  setup comparison", fontsize=13)
+
+    for r, color in ((baseline, "#888888"), (optimized, "#1f77b4")):
+        ax_v.plot(r.s, r.v_kph, color=color, lw=1.6,
+                  label=f"{r.label}  ({r.lap_time:.3f}s)")
+        i_min = int(np.argmin(r.v))
+        ax_v.plot(r.s[i_min], r.v_kph[i_min], "o", color=color, ms=5)
+    ax_v.set_ylabel("Speed [km/h]")
+    ax_v.grid(True, alpha=0.3)
+    ax_v.legend(loc="lower right", fontsize=9)
+
+    delta = time_delta(baseline, optimized)
+    ax_d.plot(baseline.s, delta, color="#d62728", lw=1.4)
+    ax_d.axhline(0.0, color="k", lw=0.8)
+    ax_d.fill_between(baseline.s, delta, 0.0, where=delta <= 0,
+                      color="#2ca02c", alpha=0.25, interpolate=True)
+    ax_d.fill_between(baseline.s, delta, 0.0, where=delta > 0,
+                      color="#d62728", alpha=0.25, interpolate=True)
+    gain = baseline.lap_time - optimized.lap_time
+    ax_d.set_ylabel("Δt vs baseline [s]")
+    ax_d.set_xlabel("Distance [m]")
+    ax_d.set_title(f"Optimized gains {gain:+.3f}s over the lap "
+                   f"(green = ahead)", fontsize=10)
+    ax_d.grid(True, alpha=0.3)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def laptime_bar_figure(results: Sequence[LapResult]):
+    """Bar chart of total lap time per setup (grouped by track)."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    labels = [f"{r.label}\n{r.track_name}" for r in results]
+    times = [r.lap_time for r in results]
+    bars = ax.bar(labels, times, color="#1f77b4", alpha=0.8)
+    for bar, t in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width() / 2, t, f"{t:.3f}s",
+                ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("Lap time [s]")
+    ax.set_title("Lap-time comparison")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    return fig

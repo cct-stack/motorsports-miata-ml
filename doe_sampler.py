@@ -9,7 +9,9 @@ random sampling for building a surrogate with limited compute budget.
 
 import numpy as np
 import pandas as pd
+from dataclasses import replace
 from scipy.stats.qmc import LatinHypercube, scale
+from config import VehicleConfig
 from vehicle_model import NCMiata
 from simulator import LapSimulator
 from track import Track
@@ -29,13 +31,19 @@ LOWER       = np.array([p[1] for p in PARAM_BOUNDS])
 UPPER       = np.array([p[2] for p in PARAM_BOUNDS])
 
 
-def run_lhs_sweep(n_samples: int = 200, track: Track = None, seed: int = 42) -> pd.DataFrame:
-    """
-    Generates n_samples setups via LHS and runs each through the lap sim.
-    Returns a DataFrame of parameters + lap_time.
+def run_lhs_sweep(n_samples: int = 200, track: Track = None, seed: int = 42,
+                  base_cfg: VehicleConfig = None) -> pd.DataFrame:
+    """Generates n_samples setups via LHS and runs each through the lap sim.
+
+    Non-suspension parameters (mass, aero, power, tire, …) are taken from
+    *base_cfg* (defaults to ``VehicleConfig()`` if not supplied).  Only the
+    four suspension params are swept.  Returns a DataFrame of parameters +
+    lap_time.
     """
     if track is None:
         track = Track()
+    if base_cfg is None:
+        base_cfg = VehicleConfig()
 
     sampler = LatinHypercube(d=len(PARAM_BOUNDS), seed=seed)
     unit_samples = sampler.random(n=n_samples)                # [0, 1]^d
@@ -43,11 +51,10 @@ def run_lhs_sweep(n_samples: int = 200, track: Track = None, seed: int = 42) -> 
 
     rows = []
     for i, params in enumerate(samples):
-        car = NCMiata()
-        car.spring_k_f = params[0]
-        car.spring_k_r = params[1]
-        car.arb_k_f    = params[2]
-        car.arb_k_r    = params[3]
+        cfg = replace(base_cfg,
+                      spring_k_f=params[0], spring_k_r=params[1],
+                      arb_k_f=params[2],    arb_k_r=params[3])
+        car = NCMiata(cfg)
 
         sim = LapSimulator(car, track)
         lap_time, _ = sim.solve()
