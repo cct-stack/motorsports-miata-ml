@@ -41,9 +41,14 @@ _PARAMS = [
     ("cg_height",     "CG height",         "m",      0.20,  0.80),
     ("spring_k_f",    "Spring front",      "N/m",    10000, 200000),
     ("spring_k_r",    "Spring rear",       "N/m",    10000, 200000),
-    ("arb_k_f",       "ARB front",         "N/m",    0,     50000),
-    ("arb_k_r",       "ARB rear",          "N/m",    0,     30000),
-    ("cl_a",          "Cl·A (downforce)",  "m²",     0,     5.0),
+    ("arb_k_f",         "ARB front",           "N/m",    0,     50000),
+    ("arb_k_r",         "ARB rear",            "N/m",    0,     30000),
+    # --- Dampers (data / AC export only; not used by QSS solver) ---
+    ("damper_bump_f",    "Damper bump front",   "N·s/m",  500,   8000),
+    ("damper_rebound_f", "Damper rebound front","N·s/m",  500,   12000),
+    ("damper_bump_r",    "Damper bump rear",    "N·s/m",  500,   8000),
+    ("damper_rebound_r", "Damper rebound rear", "N·s/m",  500,   12000),
+    ("cl_a",             "Cl·A (downforce)",    "m²",     0,     5.0),
     ("cd_a",          "Cd·A (drag)",       "m²",     0.1,   2.0),
     ("aero_balance_f","Aero balance front","frac",   0.20,  0.80),
     ("power_max",     "Peak power",        "W",      20000, 1000000),
@@ -98,6 +103,14 @@ class PipelineGUI(tk.Tk):
         # Tab 2: Lap-time bar
         self._tab_bar = ttk.Frame(nb)
         nb.add(self._tab_bar, text="Lap time")
+
+        # Tab 3: G-force traces
+        self._tab_gforce = ttk.Frame(nb)
+        nb.add(self._tab_gforce, text="G-forces")
+
+        # Tab 4: Corner min-speeds
+        self._tab_corner = ttk.Frame(nb)
+        nb.add(self._tab_corner, text="Corner speeds")
 
         self._notebook = nb
 
@@ -259,13 +272,15 @@ class PipelineGUI(tk.Tk):
     def _pipeline_body(self):
         import optuna
         from dataclasses import replace as _replace
-        from doe_sampler import run_lhs_sweep, PARAM_NAMES
+        from doe_sampler import (run_lhs_sweep, PARAM_NAMES,
+                                  snap_to_buildable, N_PER_KG_MM)
         from surrogate import LapTimeSurrogate
         from optimizer import make_objective
         from simulator import LapSimulator
         from track import Track
         from vehicle_model import NCMiata
-        from analysis import LapResult, compare_figure, laptime_bar_figure
+        from analysis import (LapResult, compare_figure, laptime_bar_figure,
+                              gforce_figure, corner_speed_figure)
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -290,11 +305,15 @@ class PipelineGUI(tk.Tk):
         study.optimize(make_objective(surrogate), n_trials=n_trials,
                        show_progress_bar=False)
         best = study.best_params
+        buildable = snap_to_buildable(best)
+        print("  theoretical → buildable (snapped to purchasable increments):")
         for k in PARAM_NAMES:
-            print(f"  {k:12s} = {best[k]/10000:.2f} kg/mm")
+            unit = "kg/mm" if "spring" in k else "kg/mm equiv"
+            print(f"    {k:12s} = {best[k]/N_PER_KG_MM:.2f}  →  "
+                  f"{buildable[k]/N_PER_KG_MM:.2f} {unit}")
 
-        print("[4/4] Simulating baseline vs optimized …")
-        opt_cfg = _replace(base_cfg, **{k: best[k] for k in PARAM_NAMES})
+        print("[4/4] Simulating baseline vs optimized (buildable setup) …")
+        opt_cfg = _replace(base_cfg, **{k: buildable[k] for k in PARAM_NAMES})
         base_res = LapResult.from_sim("Baseline",  LapSimulator(NCMiata(base_cfg), track))
         opt_res  = LapResult.from_sim("Optimized", LapSimulator(NCMiata(opt_cfg),  track))
         print(f"  Baseline : {base_res.lap_time:.3f}s")
@@ -305,7 +324,9 @@ class PipelineGUI(tk.Tk):
 
         fig_cmp = compare_figure(base_res, opt_res)
         fig_bar = laptime_bar_figure([base_res, opt_res])
-        self.after(0, lambda: self._show_figures(fig_cmp, fig_bar))
+        fig_g = gforce_figure(base_res, opt_res)
+        fig_corner = corner_speed_figure(base_res, opt_res)
+        self.after(0, lambda: self._show_figures(fig_cmp, fig_bar, fig_g, fig_corner))
         self.after(0, lambda: self._export_btn.config(state="normal"))
         print("Done!\n")
 
@@ -313,19 +334,16 @@ class PipelineGUI(tk.Tk):
     # Figure embedding
     # ------------------------------------------------------------------ #
 
-    def _show_figures(self, fig_cmp, fig_bar):
-        for widget in self._tab_speed.winfo_children():
-            widget.destroy()
-        for widget in self._tab_bar.winfo_children():
-            widget.destroy()
-
-        canvas1 = FigureCanvasTkAgg(fig_cmp, master=self._tab_speed)
-        canvas1.draw()
-        canvas1.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        canvas2 = FigureCanvasTkAgg(fig_bar, master=self._tab_bar)
-        canvas2.draw()
-        canvas2.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    def _show_figures(self, fig_cmp, fig_bar, fig_g, fig_corner):
+        for tab, fig in ((self._tab_speed, fig_cmp),
+                         (self._tab_bar, fig_bar),
+                         (self._tab_gforce, fig_g),
+                         (self._tab_corner, fig_corner)):
+            for widget in tab.winfo_children():
+                widget.destroy()
+            canvas = FigureCanvasTkAgg(fig, master=tab)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # Switch to the speed-trace tab
         self._notebook.select(self._tab_speed)

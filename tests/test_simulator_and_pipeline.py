@@ -325,6 +325,7 @@ matplotlib.use("Agg")  # no display in CI; must precede any pyplot import
 
 from analysis import (  # noqa: E402
     LapResult, time_delta, summary, compare_figure, laptime_bar_figure,
+    gforce_figure, corner_speed_figure, find_corners,
 )
 
 
@@ -375,5 +376,47 @@ def test_laptime_bar_figure_builds(tmp_path, skidpad):
     base = _lap_result("Baseline", VehicleConfig(), skidpad)
     fig = laptime_bar_figure([base])
     out = tmp_path / "bar.png"
+    fig.savefig(out)
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_gforce_properties(skidpad):
+    # On a constant-radius skidpad the lateral g is v**2*kappa/g everywhere and
+    # there is no sustained longitudinal accel once the car is up to speed.
+    r = _lap_result("Baseline", VehicleConfig(), skidpad)
+    assert r.lat_g.shape == r.s.shape
+    assert r.long_g.shape == r.s.shape
+    assert np.all(r.lat_g >= 0)
+    assert r.lat_g.max() > 0  # the car is cornering
+
+
+def test_gforce_figure_builds(tmp_path, monza):
+    from dataclasses import replace
+    base = _lap_result("Baseline", VehicleConfig(), monza)
+    opt = _lap_result("Optimized", replace(VehicleConfig(), spring_k_f=90_000.0),
+                      monza)
+    fig = gforce_figure(base, opt)
+    assert len(fig.axes) == 2
+    out = tmp_path / "g.png"
+    fig.savefig(out)
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_find_corners_on_monza(monza):
+    base = _lap_result("Baseline", VehicleConfig(), monza)
+    corners = find_corners(base.curvature)
+    assert len(corners) > 0
+    # slices are ordered, non-empty, and within bounds
+    for (i, j) in corners:
+        assert 0 <= i < j <= len(base.curvature)
+
+
+def test_corner_speed_figure_builds(tmp_path, monza):
+    from dataclasses import replace
+    base = _lap_result("Baseline", VehicleConfig(), monza)
+    opt = _lap_result("Optimized", replace(VehicleConfig(), spring_k_f=90_000.0),
+                      monza)
+    fig = corner_speed_figure(base, opt)
+    out = tmp_path / "corners.png"
     fig.savefig(out)
     assert out.is_file() and out.stat().st_size > 0

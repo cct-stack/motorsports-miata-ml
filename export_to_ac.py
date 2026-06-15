@@ -178,8 +178,17 @@ def _suspensions_ini(c: VehicleConfig) -> str:
     hub_y = 0.285  # wheel-centre height (m)
 
     def _wishbone_block(axle: str, half_t: float, ax_z: float,
-                        wr: float, arb: float, rc_h: float) -> str:
-        """Generate a double-wishbone / multilink block for one axle."""
+                        wr: float, arb: float, rc_h: float,
+                        kd_bump: float, kd_rebound: float) -> str:
+        """Generate a double-wishbone / multilink block for one axle.
+
+        AC's KD key is a single symmetric damping coefficient (N·s/m).
+        We export the average of bump and rebound as KD so neither phase is
+        significantly over- or under-represented; both raw values are preserved
+        in comments for reference.
+        """
+        kd_avg = (kd_bump + kd_rebound) / 2.0
+
         # Upper & lower wishbone inner/outer attachment points (estimated).
         # Inner = chassis-side, outer = upright-side.
         uca_in  = f"0.250 {hub_y + 0.130:.3f} {ax_z:.3f}"
@@ -200,7 +209,8 @@ def _suspensions_ini(c: VehicleConfig) -> str:
             + f"LCA_INNER={lca_in}\n"
             + f"LCA_OUTER={lca_out}\n"
             + f"KS={wr:.1f}    ; wheel rate N/m\n"
-            + f"KD=2500.0   ; damping N·s/m (placeholder — tune in setup)\n"
+            + f"KD={kd_avg:.1f}   ; avg damping N·s/m  "
+              f"(bump={kd_bump:.0f}  rebound={kd_rebound:.0f})\n"
             + f"PROGRESSIVE_SPRING_K=0\n"
             + f"BUMPSTOP_UP=0.05\n"
             + f"BUMPSTOP_DN=0.05\n"
@@ -212,9 +222,11 @@ def _suspensions_ini(c: VehicleConfig) -> str:
         )
 
     front = _wishbone_block("FRONT", half_f, -a, wr_f, c.arb_k_f,
-                            c.roll_center_height_f)
+                            c.roll_center_height_f,
+                            c.damper_bump_f, c.damper_rebound_f)
     rear  = _wishbone_block("REAR",  half_r,  b, wr_r, c.arb_k_r,
-                            c.roll_center_height_r)
+                            c.roll_center_height_r,
+                            c.damper_bump_r, c.damper_rebound_r)
 
     return _header() + front + "\n" + rear
 

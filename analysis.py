@@ -31,6 +31,7 @@ class LapResult:
     s: np.ndarray       # distance along the lap [m]
     v: np.ndarray       # speed at each point [m/s]
     ds: np.ndarray      # segment length ending at each point [m]
+    curvature: np.ndarray  # signed track curvature [1/m] at each point
     lap_time: float     # total lap time [s]
     closed: bool        # closed loop vs point-to-point
 
@@ -40,6 +41,7 @@ class LapResult:
         ds = sim._segment_lengths()
         track = sim.track
         return cls(label, track.name, np.asarray(track.s, float), v, ds,
+                   np.asarray(track.curvature, float),
                    float(lap_time), track.config == "Closed")
 
     # --- derived quantities ------------------------------------------- #
@@ -64,6 +66,22 @@ class LapResult:
             v_prev[0] = self.v[0]
         v_avg = np.maximum(0.5 * (self.v + v_prev), 1e-3)
         return np.cumsum(self.ds / v_avg)
+
+    @property
+    def lat_g(self) -> np.ndarray:
+        """Lateral acceleration at each point [g], from ``v**2 * |kappa|``."""
+        return self.v * self.v * np.abs(self.curvature) / 9.81
+
+    @property
+    def long_g(self) -> np.ndarray:
+        """Longitudinal acceleration [g] from the speed profile, derived the
+        same way the solver integrates speed: ``ax = (v[i]**2 - v[i-1]**2) /
+        (2*ds[i])``. Positive = accelerating, negative = braking."""
+        v_prev = np.roll(self.v, 1)
+        if not self.closed:
+            v_prev[0] = self.v[0]
+        ax = (self.v * self.v - v_prev * v_prev) / (2.0 * np.maximum(self.ds, 1e-6))
+        return ax / 9.81
 
 
 def time_delta(baseline: LapResult, optimized: LapResult) -> np.ndarray:
@@ -123,6 +141,93 @@ def compare_figure(baseline: LapResult, optimized: LapResult):
                    f"(green = ahead)", fontsize=10)
     ax_d.grid(True, alpha=0.3)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def find_corners(curvature: np.ndarray, frac: float = 0.15) -> List[tuple]:
+    """Locate corners as contiguous runs where ``|curvature|`` exceeds a
+    fraction of its peak. Returns a list of ``(start, stop)`` index slices in
+    track order (``stop`` exclusive). Straights fall below the threshold and
+    are skipped, so each returned slice brackets one corner's apex."""
+    kappa = np.abs(np.asarray(curvature, float))
+    kmax = float(kappa.max()) if kappa.size else 0.0
+    if kmax <= 1e-9:
+        return []
+    thresh = max(frac * kmax, 1e-4)
+    mask = kappa > thresh
+    corners: List[tuple] = []
+    n = len(mask)
+    i = 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j < n and mask[j]:
+                j += 1
+            corners.append((i, j))
+            i = j
+        else:
+            i += 1
+    return corners
+
+
+def gforce_figure(baseline: LapResult, optimized: LapResult):
+    """Two-panel G-force comparison: lateral g (cornering load) on top and
+    longitudinal g (braking/acceleration) below, both vs distance, overlaying
+    the two setups. Returns the Matplotlib ``Figure``."""
+    import matplotlib.pyplot as plt
+
+    fig, (ax_lat, ax_lon) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    fig.suptitle(f"{baseline.track_name}  -  G-force traces", fontsize=13)
+
+    for r, color in ((baseline, "#888888"), (optimized, "#1f77b4")):
+        ax_lat.plot(r.s, r.lat_g, color=color, lw=1.4, label=r.label)
+        ax_lon.plot(r.s, r.long_g, color=color, lw=1.4, label=r.label)
+
+    ax_lat.set_ylabel("Lateral g")
+    ax_lat.grid(True, alpha=0.3)
+    ax_lat.legend(loc="upper right", fontsize=9)
+
+    ax_lon.axhline(0.0, color="k", lw=0.8)
+    ax_lon.set_ylabel("Longitudinal g\n(+accel / -brake)")
+    ax_lon.set_xlabel("Distance [m]")
+    ax_lon.grid(True, alpha=0.3)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def corner_speed_figure(baseline: LapResult, optimized: LapResult,
+                        frac: float = 0.15):
+    """Grouped bar chart of the minimum speed in each detected corner,
+    baseline vs optimized. Corners are taken from the (shared) track curvature
+    so both setups are compared at the same apexes. Returns the ``Figure``."""
+    import matplotlib.pyplot as plt
+
+    corners = find_corners(baseline.curvature, frac=frac)
+    if not corners:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No corners detected on this track",
+                ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        return fig
+
+    base_speeds = [float(baseline.v_kph[i:j].min()) for (i, j) in corners]
+    opt_speeds = [float(optimized.v_kph[i:j].min()) for (i, j) in corners]
+    labels = [f"T{n + 1}" for n in range(len(corners))]
+    x = np.arange(len(corners))
+    w = 0.4
+
+    fig, ax = plt.subplots(figsize=(max(8, len(corners) * 0.6), 5))
+    ax.bar(x - w / 2, base_speeds, w, color="#888888", label="Baseline")
+    ax.bar(x + w / 2, opt_speeds, w, color="#1f77b4", label="Optimized")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Min speed [km/h]")
+    ax.set_xlabel("Corner (track order)")
+    ax.set_title(f"{baseline.track_name}  -  minimum speed per corner")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
     return fig
 
 

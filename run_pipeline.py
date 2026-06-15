@@ -63,12 +63,14 @@ def main(argv=None) -> int:
 
     # Imports that pull in heavy deps are deferred so --help stays instant.
     from car_io import load_json
-    from doe_sampler import run_lhs_sweep, PARAM_NAMES, LOWER, UPPER
+    from doe_sampler import (run_lhs_sweep, PARAM_NAMES, LOWER, UPPER,
+                             snap_to_buildable, N_PER_KG_MM)
     from surrogate import LapTimeSurrogate
     from optimizer import make_objective
     from simulator import LapSimulator
     from export_to_ac import export_ac_car
-    from analysis import LapResult, compare_figure, laptime_bar_figure, summary
+    from analysis import (LapResult, compare_figure, laptime_bar_figure,
+                          gforce_figure, corner_speed_figure, summary)
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -95,12 +97,14 @@ def main(argv=None) -> int:
     study.optimize(make_objective(surrogate), n_trials=args.trials,
                    show_progress_bar=not _frozen())
     best = study.best_params
-    print("  optimal setup:")
+    buildable = snap_to_buildable(best)
+    print("  theoretical → buildable (snapped to purchasable increments):")
     for k in PARAM_NAMES:
-        print(f"    {k:12s} = {best[k]/10000:6.2f} kg/mm")
+        print(f"    {k:12s} = {best[k]/N_PER_KG_MM:6.2f} kg/mm  →  "
+              f"{buildable[k]/N_PER_KG_MM:.2f} kg/mm")
 
-    print("[4/5] Simulating baseline vs optimized...")
-    opt_cfg = replace(base_cfg, **{k: best[k] for k in PARAM_NAMES})
+    print("[4/5] Simulating baseline vs optimized (using buildable setup)...")
+    opt_cfg = replace(base_cfg, **{k: buildable[k] for k in PARAM_NAMES})
     from vehicle_model import NCMiata
     base = LapResult.from_sim("Baseline", LapSimulator(NCMiata(base_cfg), track))
     opt = LapResult.from_sim("Optimized", LapSimulator(NCMiata(opt_cfg), track))
@@ -115,11 +119,17 @@ def main(argv=None) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     fig_cmp = compare_figure(base, opt)
     fig_bar = laptime_bar_figure([base, opt])
+    fig_g = gforce_figure(base, opt)
+    fig_corner = corner_speed_figure(base, opt)
     cmp_png = outdir / f"comparison_{args.track}.png"
     bar_png = outdir / f"laptime_{args.track}.png"
+    g_png = outdir / f"gforce_{args.track}.png"
+    corner_png = outdir / f"corner_speed_{args.track}.png"
     fig_cmp.savefig(cmp_png, dpi=120)
     fig_bar.savefig(bar_png, dpi=120)
-    print(f"    graphs -> {cmp_png}  and  {bar_png}")
+    fig_g.savefig(g_png, dpi=120)
+    fig_corner.savefig(corner_png, dpi=120)
+    print(f"    graphs -> {cmp_png}, {bar_png}, {g_png}, {corner_png}")
 
     print(f"[5/5] Exporting Assetto Corsa physics -> {args.export_dir}")
     export_ac_car(opt_cfg, output_dir=args.export_dir)

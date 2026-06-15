@@ -53,6 +53,16 @@ class VehicleConfig:
     arb_k_f: float = 15_000.0       # front ARB equivalent wheel rate (N/m)
     arb_k_r: float = 5_000.0        # rear ARB equivalent wheel rate (N/m)
 
+    # --- Dampers (data / export only — not used by QSS solver) ---
+    # Values in N·s/m at the wheel (after motion ratio).
+    # Typical NC Miata coilover: bump 1 500–3 000, rebound 2 500–5 000.
+    # Default here represents a mild track setup (e.g. Koni STR.T or BC Racing).
+    # A 2:1 rebound-to-bump ratio is normal; stiffer rebound controls roll back.
+    damper_bump_f: float = 2_000.0      # front bump (compression) N·s/m
+    damper_rebound_f: float = 3_500.0   # front rebound (extension)  N·s/m
+    damper_bump_r: float = 2_000.0      # rear  bump (compression)   N·s/m
+    damper_rebound_r: float = 3_500.0   # rear  rebound (extension)  N·s/m
+
     # --- Suspension geometry / installation ---
     motion_ratio_f: float = 0.95    # wheel travel / spring travel, front
     motion_ratio_r: float = 0.90    # rear

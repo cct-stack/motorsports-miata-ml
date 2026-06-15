@@ -20,15 +20,46 @@ from track import Track
 # --- Parameter space definition ---
 # (name, lower_bound, upper_bound) in SI units (N/m)
 PARAM_BOUNDS = [
-    ("spring_k_f", 40_000,  120_000),  # Front spring: 4 to 12 kg/mm
-    ("spring_k_r", 20_000,   80_000),  # Rear spring:  2 to 8 kg/mm
-    ("arb_k_f",        0,   30_000),   # Front ARB: 0 to 3 kg/mm equiv
-    ("arb_k_r",        0,   15_000),   # Rear ARB:  0 to 1.5 kg/mm equiv
+    ("spring_k_f", 40_000,  120_000),  # Front spring: ~4 to 12 kgf/mm
+    ("spring_k_r", 20_000,   80_000),  # Rear spring:  ~2 to 8 kgf/mm
+    ("arb_k_f",        0,   30_000),   # Front ARB: 0 to ~3 kgf/mm equiv
+    ("arb_k_r",        0,   15_000),   # Rear ARB:  0 to ~1.5 kgf/mm equiv
 ]
 
 PARAM_NAMES = [p[0] for p in PARAM_BOUNDS]
 LOWER       = np.array([p[1] for p in PARAM_BOUNDS])
 UPPER       = np.array([p[2] for p in PARAM_BOUNDS])
+
+# ── Unit conversion ──────────────────────────────────────────────────────────
+# 1 kgf/mm = 9.81 N/mm = 9 810 N/m  (using g = 9.81 m/s²)
+N_PER_KG_MM: float = 9_810.0
+
+# Purchasable snap steps per parameter (kgf/mm).
+# Springs: 0.5 kgf/mm matches standard coilover-spring catalogue increments
+#          (Swift, Hyperco, Eibach ERS, most 65 mm-ID generic springs).
+# ARBs: 0.1 kgf/mm equivalent – finer because adjustable bars give several
+#       discrete positions; caller should note the target, not a part number.
+_SNAP_STEPS_KG_MM: dict = {
+    "spring_k_f": 0.5,
+    "spring_k_r": 0.5,
+    "arb_k_f":    0.1,
+    "arb_k_r":    0.1,
+}
+
+
+def snap_to_buildable(params: dict) -> dict:
+    """Round optimizer output to nearest purchasable increment.
+
+    Input and output are both in SI (N/m), same keys as *params*.
+    Springs snap to 0.5 kgf/mm; ARBs snap to 0.1 kgf/mm equivalent.
+    The returned config is what actually gets simulated and exported so
+    the reported lap-time gain reflects a setup you can physically build.
+    """
+    out = {}
+    for k, v_si in params.items():
+        step_si = _SNAP_STEPS_KG_MM.get(k, 0.5) * N_PER_KG_MM
+        out[k] = round(v_si / step_si) * step_si
+    return out
 
 
 def run_lhs_sweep(n_samples: int = 200, track: Track = None, seed: int = 42,

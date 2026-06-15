@@ -19,7 +19,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from config import VehicleConfig
-from doe_sampler import run_lhs_sweep, PARAM_NAMES, LOWER, UPPER
+from doe_sampler import (run_lhs_sweep, PARAM_NAMES, LOWER, UPPER,
+                         snap_to_buildable, N_PER_KG_MM)
 from surrogate import LapTimeSurrogate
 from vehicle_model import NCMiata
 
@@ -84,16 +85,23 @@ def run_optimization(surrogate: LapTimeSurrogate, n_trials: int = 2000,
     study.optimize(make_objective(surrogate), n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
+    buildable = snap_to_buildable(best)
     print("\n=== OPTIMAL SUSPENSION SETUP ===")
-    print(f"  Front Spring: {best['spring_k_f']/10000:.1f} kg/mm")
-    print(f"  Rear Spring:  {best['spring_k_r']/10000:.1f} kg/mm")
-    print(f"  Front ARB:    {best['arb_k_f']/10000:.2f} kg/mm equiv")
-    print(f"  Rear ARB:     {best['arb_k_r']/10000:.2f} kg/mm equiv")
+    print(f"  {'Parameter':<14} {'Theoretical':>12}  {'Buildable':>10}")
+    print(f"  {'-'*40}")
+    labels = {"spring_k_f": "Front Spring",
+              "spring_k_r": "Rear Spring",
+              "arb_k_f":    "Front ARB",
+              "arb_k_r":    "Rear ARB"}
+    for k in PARAM_NAMES:
+        unit = "kg/mm" if "spring" in k else "kg/mm equiv"
+        print(f"  {labels[k]:<14} {best[k]/N_PER_KG_MM:>10.2f}  "
+              f"→  {buildable[k]/N_PER_KG_MM:.2f} {unit}")
 
     # Verify with actual simulator (not surrogate), using the loaded car's base params
     from track import Track
     from simulator import LapSimulator
-    opt_cfg = replace(base_cfg, **{k: best[k] for k in PARAM_NAMES})
+    opt_cfg = replace(base_cfg, **{k: buildable[k] for k in PARAM_NAMES})
     car = NCMiata(opt_cfg)
     sim = LapSimulator(car, Track())
     actual_time, _ = sim.solve()
