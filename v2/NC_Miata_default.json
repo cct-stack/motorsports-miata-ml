@@ -1,0 +1,97 @@
+{
+  "name": "NC Miata",
+  "mass": 1130.0,
+  "wheelbase": 2.33,
+  "cg_height": 0.45,
+  "weight_dist_f": 0.52,
+  "spring_k_f": 70000.0,
+  "spring_k_r": 40000.0,
+  "arb_k_f": 15000.0,
+  "arb_k_r": 5000.0,
+  "damper_bump_f": 2000.0,
+  "damper_rebound_f": 3500.0,
+  "damper_bump_r": 2000.0,
+  "damper_rebound_r": 3500.0,
+  "motion_ratio_f": 0.95,
+  "motion_ratio_r": 0.9,
+  "track_f": 1.49,
+  "track_r": 1.49,
+  "roll_center_height_f": 0.05,
+  "roll_center_height_r": 0.075,
+  "unsprung_mass_f": 40.0,
+  "unsprung_mass_r": 40.0,
+  "unsprung_cg_height": 0.28,
+  "cl_a": 0.0,
+  "aero_balance_f": 0.45,
+  "cd_a": 0.63,
+  "rho": 1.225,
+  "power_max": 125000.0,
+  "efficiency": 0.85,
+  "tire": {
+    "coeffs": {
+      "pCy1": 1.6,
+      "pDy1": 1.5,
+      "pDy2": -0.11,
+      "pKy1": 36.0,
+      "pKy2": 2.0,
+      "pEy1": -0.4,
+      "pEy2": 0.0
+    },
+    "Fz0": 2500.0,
+    "name": "Bridgestone_RE-71RS_representative"
+  },
+  "tyre_radius": 0.306,
+  "Cr": 0.015,
+  "torque_curve": [
+    [
+      1000,
+      130
+    ],
+    [
+      2000,
+      160
+    ],
+    [
+      3000,
+      176
+    ],
+    [
+      4000,
+      184
+    ],
+    [
+      5000,
+      188
+    ],
+    [
+      6000,
+      182
+    ],
+    [
+      7000,
+      170
+    ],
+    [
+      7500,
+      150
+    ],
+    [
+      7750,
+      120
+    ]
+  ],
+  "gear_ratios": [
+    3.136,
+    1.888,
+    1.33,
+    1.0,
+    0.814,
+    0.657
+  ],
+  "final_drive": 4.1,
+  "primary_ratio": 1.0,
+  "primary_eff": 1.0,
+  "gear_eff": 0.97,
+  "final_eff": 0.97,
+  "shift_time": 0.2
+}
