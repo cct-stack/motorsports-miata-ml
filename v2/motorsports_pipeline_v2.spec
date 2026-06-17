@@ -13,7 +13,7 @@
 # Result lands in dist/motorsports_pipeline_v2.exe  (Windows) or
 # dist/motorsports_pipeline_v2  (Linux/macOS).
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
@@ -25,14 +25,15 @@ datas = [
 binaries = []
 hiddenimports = []
 
-# Scientific / ML packages — pull everything so no hidden data files are missed
-for pkg in ("sklearn", "scipy", "optuna", "pandas"):
+# Scientific / ML packages — pull everything (modules + data files + binaries)
+# so nothing is missed at runtime. matplotlib MUST be here (not just
+# collect_submodules) or its mpl-data/ fonts/backends are left out.
+for pkg in ("matplotlib", "numpy", "sklearn", "scipy", "optuna", "pandas", "openpyxl"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas     += pkg_datas
     binaries  += pkg_binaries
     hiddenimports += pkg_hidden
 
-hiddenimports += collect_submodules("matplotlib")
 hiddenimports += [
     "matplotlib.backends.backend_tkagg",
     "tkinter",
