@@ -89,3 +89,71 @@ def test_grip_scaling_only_slows_the_lap(slalom):
     """Grip scale <= 1 can never make the QSS lap faster than the baseline."""
     res = run_transient_lap(NCMiata(SOFT), slalom, n_laps=2)
     assert res.lap_time_transient >= res.lap_time_qss - 1e-9
+
+
+# ── Joint damper optimization (transient DoE + penalty surrogate) ────────────
+
+import optuna  # noqa: E402
+
+from doe_sampler import (run_lhs_sweep, run_transient_doe, snap_dampers,  # noqa: E402
+                         PARAM_NAMES, DAMPER_PARAM_NAMES, TRANSIENT_PARAM_NAMES,
+                         PARAM_RANGE)
+from surrogate import LapTimeSurrogate  # noqa: E402
+from optimizer import make_joint_objective, run_joint_optimization  # noqa: E402
+
+
+def test_snap_dampers_rounds_to_increment():
+    """Damper coefficients snap to the nearest 250 N·s/m settable step."""
+    out = snap_dampers({"damper_bump_f": 1715.0, "damper_rebound_f": 4714.0,
+                        "damper_bump_r": 3341.0, "damper_rebound_r": 4631.0})
+    assert out == {"damper_bump_f": 1750.0, "damper_rebound_f": 4750.0,
+                   "damper_bump_r": 3250.0, "damper_rebound_r": 4750.0}
+    assert all(v % 250 == 0 for v in out.values())
+
+
+def test_transient_doe_columns_and_nonnegative_penalty(slalom):
+    """The 8-param transient DoE yields the expected columns and delta >= 0."""
+    df = run_transient_doe(n_samples=4, track=slalom, n_laps=2, seed=7)
+    assert list(df.columns) == TRANSIENT_PARAM_NAMES + ["delta"]
+    assert df.shape == (4, 9)
+    assert (df["delta"] >= -1e-9).all()
+
+
+@pytest.fixture(scope="module")
+def joint_surrogates(slalom):
+    """Tiny QSS + penalty surrogates trained on the slalom for objective tests."""
+    qss = LapTimeSurrogate()
+    qss.fit(run_lhs_sweep(n_samples=12, track=slalom))
+    pen = LapTimeSurrogate()
+    pen.fit(run_transient_doe(n_samples=5, track=slalom, n_laps=2, seed=11),
+            target_col="delta")
+    return qss, pen
+
+
+def test_surrogate_feature_order_contract(joint_surrogates):
+    """The joint objective relies on these exact feature orderings."""
+    qss, pen = joint_surrogates
+    assert qss.feature_names == PARAM_NAMES
+    assert pen.feature_names == TRANSIENT_PARAM_NAMES
+
+
+def test_joint_objective_is_finite_for_8_params(joint_surrogates):
+    """make_joint_objective returns a finite score for an in-bounds setup."""
+    qss, pen = joint_surrogates
+    objective = make_joint_objective(qss, pen)
+    mid = {n: 0.5 * (PARAM_RANGE[n][0] + PARAM_RANGE[n][1])
+           for n in TRANSIENT_PARAM_NAMES}
+    val = objective(optuna.trial.FixedTrial(mid))
+    assert np.isfinite(val)
+
+
+def test_run_joint_optimization_returns_buildable_8_params(joint_surrogates, slalom):
+    """Joint optimization returns a snapped, in-bounds 8-parameter setup."""
+    qss, pen = joint_surrogates
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    _, buildable = run_joint_optimization(qss, pen, n_trials=40, track=slalom)
+    assert set(buildable) == set(TRANSIENT_PARAM_NAMES)
+    for k in DAMPER_PARAM_NAMES:
+        lo, hi = PARAM_RANGE[k]
+        assert buildable[k] % 250 == 0
+        assert lo - 250 <= buildable[k] <= hi + 250

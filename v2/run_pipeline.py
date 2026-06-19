@@ -59,6 +59,18 @@ def main(argv=None) -> int:
     p.add_argument("--transient", action="store_true",
                    help="also run the 7-DOF transient damper analysis on the "
                         "optimized setup and save a damper-sensitivity report")
+    p.add_argument("--optimize-dampers", action="store_true",
+                   help="jointly optimise dampers with springs/ARBs (8 vars) "
+                        "using a transient penalty surrogate; slower (builds a "
+                        "transient DoE) but the dampers are tuned, not just fixed")
+    p.add_argument("--damper-samples", type=int, default=120,
+                   help="transient DoE samples for the damper penalty surrogate "
+                        "(only used with --optimize-dampers; default: 120)")
+    p.add_argument("--export-channels", default=None,
+                   metavar="PATH",
+                   help="write per-point channel data for the optimized setup to "
+                        "PATH (.csv) or PATH (.xlsx); e.g. --export-channels "
+                        "channels_monza.csv")
     args = p.parse_args(argv)
 
     if args.no_show:
@@ -66,14 +78,17 @@ def main(argv=None) -> int:
 
     # Imports that pull in heavy deps are deferred so --help stays instant.
     from car_io import load_json
-    from doe_sampler import (run_lhs_sweep, PARAM_NAMES, LOWER, UPPER,
-                             snap_to_buildable, N_PER_KG_MM)
+    from doe_sampler import (run_lhs_sweep, PARAM_NAMES, TRANSIENT_PARAM_NAMES,
+                             LOWER, UPPER, snap_to_buildable, N_PER_KG_MM)
     from surrogate import LapTimeSurrogate
     from optimizer import make_objective
     from simulator import LapSimulator
     from export_to_ac import export_ac_car
     from analysis import (LapResult, compare_figure, laptime_bar_figure,
-                          gforce_figure, corner_speed_figure, summary)
+                          gforce_figure, corner_speed_figure, summary,
+                          build_lap_channels, lap_summary,
+                          gg_diagram_figure, channels_figure,
+                          channels_to_csv, channels_to_excel)
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -94,20 +109,34 @@ def main(argv=None) -> int:
     surrogate = LapTimeSurrogate()
     surrogate.fit(df)
 
-    print(f"[3/5] Bayesian optimisation: {args.trials} surrogate queries...")
-    study = optuna.create_study(
-        direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(make_objective(surrogate), n_trials=args.trials,
-                   show_progress_bar=not _frozen())
-    best = study.best_params
-    buildable = snap_to_buildable(best)
-    print("  theoretical → buildable (snapped to purchasable increments):")
-    for k in PARAM_NAMES:
-        print(f"    {k:12s} = {best[k]/N_PER_KG_MM:6.2f} kg/mm  →  "
-              f"{buildable[k]/N_PER_KG_MM:.2f} kg/mm")
+    if args.optimize_dampers:
+        from optimizer import build_penalty_surrogate, run_joint_optimization
+        print(f"[3/5] Joint optimisation (springs/ARBs + dampers, 8 vars)...")
+        print(f"      building transient penalty surrogate "
+              f"({args.damper_samples} transient DoE runs — this is the slow part)...")
+        penalty = build_penalty_surrogate(n_doe_samples=args.damper_samples,
+                                          track=track, base_cfg=base_cfg,
+                                          force_retrain=True)
+        _, buildable = run_joint_optimization(surrogate, penalty,
+                                              n_trials=args.trials,
+                                              base_cfg=base_cfg, track=track)
+        setup_keys = TRANSIENT_PARAM_NAMES
+    else:
+        print(f"[3/5] Bayesian optimisation: {args.trials} surrogate queries...")
+        study = optuna.create_study(
+            direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(make_objective(surrogate), n_trials=args.trials,
+                       show_progress_bar=not _frozen())
+        best = study.best_params
+        buildable = snap_to_buildable(best)
+        print("  theoretical → buildable (snapped to purchasable increments):")
+        for k in PARAM_NAMES:
+            print(f"    {k:12s} = {best[k]/N_PER_KG_MM:6.2f} kg/mm  →  "
+                  f"{buildable[k]/N_PER_KG_MM:.2f} kg/mm")
+        setup_keys = PARAM_NAMES
 
     print("[4/5] Simulating baseline vs optimized (using buildable setup)...")
-    opt_cfg = replace(base_cfg, **{k: buildable[k] for k in PARAM_NAMES})
+    opt_cfg = replace(base_cfg, **{k: buildable[k] for k in setup_keys})
     from vehicle_model import NCMiata
     base = LapResult.from_sim("Baseline", LapSimulator(NCMiata(base_cfg), track))
     opt = LapResult.from_sim("Optimized", LapSimulator(NCMiata(opt_cfg), track))
@@ -133,6 +162,34 @@ def main(argv=None) -> int:
     fig_g.savefig(g_png, dpi=120)
     fig_corner.savefig(corner_png, dpi=120)
     print(f"    graphs -> {cmp_png}, {bar_png}, {g_png}, {corner_png}")
+
+    # Optional per-point channel export
+    if args.export_channels:
+        ch_path = Path(args.export_channels)
+        ch_df   = build_lap_channels(opt, NCMiata(opt_cfg))
+        smry    = lap_summary(ch_df)
+        print(f"[+] Channel summary — optimized setup on {track.name}:")
+        print(f"    v_max {smry['v_max_kph']:.1f} km/h  |  "
+              f"max lat g {smry['max_lat_g']:.2f}  |  "
+              f"max power {smry['max_power_kW']:.1f} kW  |  "
+              f"gears used {smry['gears_used']}")
+        print(f"    throttle {smry['pct_accelerating']:.0f}%  |  "
+              f"braking {smry['pct_braking']:.0f}%  |  "
+              f"cornering {smry['pct_cornering']:.0f}%")
+        if ch_path.suffix.lower() == ".xlsx":
+            channels_to_excel(ch_df, str(ch_path))
+        else:
+            channels_to_csv(ch_df, str(ch_path))
+        print(f"    channel data -> {ch_path}")
+
+        # Save GG and channel figures alongside the other PNGs
+        fig_gg  = gg_diagram_figure(ch_df, label=f"{opt_cfg.name} — {track.name}")
+        fig_ch  = channels_figure(ch_df,   label=f"{opt_cfg.name} — {track.name}")
+        gg_png  = outdir / f"gg_diagram_{args.track}.png"
+        ch_png  = outdir / f"channels_{args.track}.png"
+        fig_gg.savefig(gg_png, dpi=120)
+        fig_ch.savefig(ch_png, dpi=120)
+        print(f"    figures -> {gg_png}, {ch_png}")
 
     print(f"[5/5] Exporting Assetto Corsa physics -> {args.export_dir}")
     export_ac_car(opt_cfg, output_dir=args.export_dir)

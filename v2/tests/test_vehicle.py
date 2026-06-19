@@ -76,8 +76,8 @@ def test_resistive_forces_ground_truth(car):
 
 
 def test_tractive_force_ground_truth(car):
-    assert abs(car.tractive_force(0.0) - 5139.5525) < 1.0
-    assert abs(car.tractive_force(30.0) - 3811.1466) < 1.0
+    assert abs(car.tractive_force(0.0) - 6252.3574) < 1.0
+    assert abs(car.tractive_force(30.0) - 3778.0936) < 1.0
 
 
 def test_downforce_v_squared_scaling(aero_car):
@@ -121,7 +121,7 @@ def test_no_downforce_grip_is_flat():
 # Longitudinal coupling (friction circle)
 # --------------------------------------------------------------------------- #
 def test_long_accel_ground_truth(car):
-    assert abs(car.get_max_long_accel(10.0, 0.0, AY0) - 6.255526) < 1e-2
+    assert abs(car.get_max_long_accel(10.0, 0.0, AY0) - 7.885259) < 1e-2
 
 
 def test_decel_ground_truth(car):

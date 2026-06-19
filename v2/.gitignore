@@ -23,6 +23,8 @@ env/
 # DoE/surrogate stages; keep them out of version control.
 doe_results.csv
 surrogate.pkl
+transient_doe.csv
+penalty_surrogate.pkl
 nc_miata_qss/
 ac_data_extracted/
 output/

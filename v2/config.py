@@ -22,15 +22,18 @@ from tire_model import PacejkaTire
 
 
 def _default_torque_curve() -> List[Tuple[int, int]]:
-    # NC2 2.0L MZR (rpm, Nm) at the crank; peak power ~125 kW @ 7000 rpm.
+    # NC1 2.0L MZR (LF-VE), 2006 MX-5 (rpm, Nm) at the crank.
+    # Spec sheet peaks: 140 lb-ft (~190 Nm) @ 5000 rpm, 170 hp (~127 kW) @ 6700
+    # rpm; rev limit ~7000 rpm. Intermediate points are a smooth fit.
     return [
-        (1000, 130), (2000, 160), (3000, 176), (4000, 184),
-        (5000, 188), (6000, 182), (7000, 170), (7500, 150), (7750, 120),
+        (1000, 130), (2000, 162), (3000, 178), (4000, 186),
+        (5000, 190), (6000, 184), (6700, 181), (7000, 168),
     ]
 
 
 def _default_gear_ratios() -> List[float]:
-    return [3.136, 1.888, 1.330, 1.000, 0.814, 0.657]
+    # NC1 2006 6-speed manual (Aisin AZ6). 5-speed cars used different ratios.
+    return [3.815, 2.260, 1.640, 1.177, 1.000, 0.832]
 
 
 @dataclass
@@ -83,7 +86,7 @@ class VehicleConfig:
     rho: float = 1.225              # air density (kg/m^3)
 
     # --- Powertrain (descriptive spec) ---
-    power_max: float = 125_000.0    # W (~167 hp)
+    power_max: float = 126_800.0    # W (170 hp, NC1 2006 spec)
     efficiency: float = 0.85        # overall drivetrain efficiency
 
     # --- Tire ---
@@ -91,7 +94,7 @@ class VehicleConfig:
     tyre_radius: float = 0.306      # m (205/50R16 rolling radius)
     Cr: float = 0.015               # rolling-resistance coefficient
 
-    # --- Engine / drivetrain (NC2 2.0L MZR, 6-speed) ---
+    # --- Engine / drivetrain (NC1 2006 2.0L MZR, 6-speed) ---
     torque_curve: List[Tuple[int, int]] = field(default_factory=_default_torque_curve)
     gear_ratios: List[float] = field(default_factory=_default_gear_ratios)
     final_drive: float = 4.10

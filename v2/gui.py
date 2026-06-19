@@ -12,6 +12,7 @@ Layout
 """
 from __future__ import annotations
 
+import platform
 import queue
 import sys
 import threading
@@ -23,7 +24,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 import matplotlib
 matplotlib.use("Agg")          # must come before pyplot import
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                               NavigationToolbar2Tk)
 
 from config import VehicleConfig
 from car_io import load_json, save_json
@@ -64,7 +66,7 @@ class PipelineGUI(tk.Tk):
         super().__init__()
         self.title("Motorsport Pipeline")
         self.resizable(True, True)
-        self.minsize(860, 640)
+        self._apply_screen_geometry()
 
         self._cfg = VehicleConfig()          # current car config
         self._log_queue: queue.Queue[str] = queue.Queue()
@@ -74,6 +76,36 @@ class PipelineGUI(tk.Tk):
         self._build_ui()
         self._load_cfg_into_fields(self._cfg)
         self._poll_log()
+
+    # ------------------------------------------------------------------ #
+    # Window sizing
+    # ------------------------------------------------------------------ #
+
+    def _apply_screen_geometry(self):
+        """Size the window to the host screen so the EXE opens at a sensible
+        size on any monitor instead of a fixed geometry."""
+        self.minsize(860, 640)
+        try:
+            self.update_idletasks()
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            # Scale Tk fonts/widgets to the monitor DPI (crisp on hi-DPI).
+            try:
+                self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
+            except Exception:
+                pass
+            w, h = max(860, int(sw * 0.85)), max(640, int(sh * 0.85))
+            x, y = (sw - w) // 2, max(0, (sh - h) // 3)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+        # Best-effort true maximize where the window manager supports it.
+        try:
+            self.state("zoomed")
+        except Exception:
+            try:
+                self.attributes("-zoomed", True)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # UI construction
@@ -116,7 +148,16 @@ class PipelineGUI(tk.Tk):
         self._tab_transient = ttk.Frame(nb)
         nb.add(self._tab_transient, text="Damper analysis")
 
+        # Tab 6: G-G diagram
+        self._tab_gg = ttk.Frame(nb)
+        nb.add(self._tab_gg, text="G-G diagram")
+
+        # Tab 7: Channel data
+        self._tab_channels = ttk.Frame(nb)
+        nb.add(self._tab_channels, text="Channels")
+
         self._notebook = nb
+        self._channels_df = None   # last computed channel DataFrame
 
     def _build_car_frame(self, parent):
         frm = ttk.LabelFrame(parent, text="Car Definition", padding=6)
@@ -166,9 +207,22 @@ class PipelineGUI(tk.Tk):
                                       command=self._on_export, state="disabled")
         self._export_btn.grid(row=0, column=7, padx=(4,0))
 
+        self._export_data_btn = ttk.Button(frm, text="Export data (CSV/Excel)…",
+                                           command=self._on_export_data, state="disabled")
+        self._export_data_btn.grid(row=0, column=8, padx=(4,0))
+
+        ttk.Label(frm, text="Damper DoE:").grid(row=1, column=0, sticky=tk.E, padx=(0,4))
+        self._damper_samples_var = tk.StringVar(value="60")
+        ttk.Spinbox(frm, textvariable=self._damper_samples_var, from_=10, to=500,
+                    increment=10, width=7).grid(row=1, column=1, sticky=tk.W)
+
         self._transient_btn = ttk.Button(frm, text="Damper analysis (transient)",
                                          command=self._on_transient)
         self._transient_btn.grid(row=1, column=6, columnspan=2, pady=(6, 0))
+
+        self._optimize_btn = ttk.Button(frm, text="\u2699  Optimize dampers (slow)",
+                                        command=self._on_optimize_dampers)
+        self._optimize_btn.grid(row=2, column=6, columnspan=2, pady=(6, 0))
 
     # ------------------------------------------------------------------ #
     # Field helpers
@@ -242,6 +296,7 @@ class PipelineGUI(tk.Tk):
             return
         self._run_btn.config(state="disabled")
         self._export_btn.config(state="disabled")
+        self._optimize_btn.config(state="disabled")
         self._log("─" * 60 + "\n")
         thread = threading.Thread(target=self._run_pipeline, daemon=True)
         thread.start()
@@ -257,6 +312,27 @@ class PipelineGUI(tk.Tk):
             export_ac_car(self._export_cfg, output_dir=folder)
             self._log(f"AC physics exported to {folder}\n")
             messagebox.showinfo("Export done", f"Physics written to:\n{folder}")
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+
+    def _on_export_data(self):
+        """Save the last-computed channel DataFrame to CSV or Excel."""
+        if self._channels_df is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export channel data",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx"), ("All files", "*.*")])
+        if not path:
+            return
+        from analysis import channels_to_csv, channels_to_excel
+        try:
+            if path.lower().endswith(".xlsx"):
+                channels_to_excel(self._channels_df, path)
+            else:
+                channels_to_csv(self._channels_df, path)
+            self._log(f"Channel data exported to {path}\n")
+            messagebox.showinfo("Export done", f"Data written to:\n{path}")
         except Exception as exc:
             messagebox.showerror("Export error", str(exc))
 
@@ -308,14 +384,117 @@ class PipelineGUI(tk.Tk):
         self.after(0, lambda: self._show_transient_figure(fig))
         print("Done!\n")
 
-    def _show_transient_figure(self, fig):
-        tab = self._tab_transient
+    def _embed_figure(self, tab, fig):
+        """Draw *fig* into *tab* with an interactive pan/zoom/save toolbar."""
         for widget in tab.winfo_children():
             widget.destroy()
         canvas = FigureCanvasTkAgg(fig, master=tab)
         canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self._notebook.select(tab)
+        toolbar = NavigationToolbar2Tk(canvas, tab, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def _show_transient_figure(self, fig):
+        self._embed_figure(self._tab_transient, fig)
+        self._notebook.select(self._tab_transient)
+
+    # ------------------------------------------------------------------ #
+    # Optimize dampers (joint 8-variable optimisation, background thread)
+    # ------------------------------------------------------------------ #
+
+    def _on_optimize_dampers(self):
+        try:
+            self._cfg = self._read_fields_into_cfg()
+        except Exception as exc:
+            messagebox.showerror("Invalid parameters", str(exc))
+            return
+        n_damper = int(self._damper_samples_var.get())
+        track_name = self._track_var.get()
+        per = 45 if track_name == "monza" else 1   # ~seconds per transient sample
+        est_min = max(1, round(n_damper * per / 60))
+        proceed = messagebox.askokcancel(
+            "Optimize dampers — heads up",
+            f"Joint damper optimisation builds a transient DoE of {n_damper} "
+            f"7-DOF runs, then a Bayesian search over 8 variables "
+            f"(springs, ARBs, and all four dampers).\n\n"
+            f"On '{track_name}' the transient DoE alone can take roughly "
+            f"{est_min} minute(s); a smaller 'Damper DoE' value is faster but "
+            f"coarser.\n\n"
+            f"The window stays responsive and progress is shown in the Log tab. "
+            f"Start now?")
+        if not proceed:
+            return
+        self._run_btn.config(state="disabled")
+        self._export_btn.config(state="disabled")
+        self._transient_btn.config(state="disabled")
+        self._optimize_btn.config(state="disabled")
+        self._log("─" * 60 + "\n")
+        thread = threading.Thread(target=self._run_optimize_dampers, daemon=True)
+        thread.start()
+
+    def _run_optimize_dampers(self):
+        import sys as _sys
+        orig_stdout = _sys.stdout
+        _sys.stdout = _QueueWriter(self._log_queue)
+        try:
+            self._optimize_dampers_body()
+        except Exception as exc:
+            self._log_queue.put(f"\n[ERROR] {exc}\n")
+        finally:
+            _sys.stdout = orig_stdout
+            self.after(0, lambda: self._run_btn.config(state="normal"))
+            self.after(0, lambda: self._transient_btn.config(state="normal"))
+            self.after(0, lambda: self._optimize_btn.config(state="normal"))
+
+    def _optimize_dampers_body(self):
+        import optuna
+        from dataclasses import replace as _replace
+        from doe_sampler import run_lhs_sweep, run_transient_doe
+        from surrogate import LapTimeSurrogate
+        from optimizer import run_joint_optimization
+        from track import Track
+        from vehicle_model import NCMiata
+        from transient_lap import run_transient_lap
+        from analysis import transient_report_figure
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        track_name = self._track_var.get()
+        n_samples  = int(self._samples_var.get())
+        n_trials   = int(self._trials_var.get())
+        n_damper   = int(self._damper_samples_var.get())
+        base_cfg   = self._cfg
+        track = Track.monza() if track_name == "monza" else Track()
+
+        print(f"Optimize dampers (joint 8-variable)  |  {base_cfg.name}  |  {track.name}")
+        print(f"[1/4] QSS DoE — {n_samples} LHS setups …")
+        df = run_lhs_sweep(n_samples=n_samples, track=track, base_cfg=base_cfg)
+
+        print("[2/4] Training QSS GP surrogate …")
+        qss = LapTimeSurrogate()
+        qss.fit(df)
+
+        print(f"[3/4] Transient DoE — {n_damper} 7-DOF runs (the slow part) …")
+        tdf = run_transient_doe(n_samples=n_damper, track=track, base_cfg=base_cfg)
+        penalty = LapTimeSurrogate()
+        penalty.fit(tdf, target_col="delta")
+
+        print(f"[4/4] Joint Bayesian optimisation — {n_trials} trials, 8 variables …")
+        _, buildable = run_joint_optimization(qss, penalty, n_trials=n_trials,
+                                              base_cfg=base_cfg, track=track,
+                                              show_progress_bar=False)
+
+        opt_cfg = _replace(base_cfg, **buildable)
+        self._export_cfg = opt_cfg
+        self.after(0, lambda: self._load_cfg_into_fields(opt_cfg))
+
+        tr = run_transient_lap(NCMiata(opt_cfg), track)
+        fig = transient_report_figure(
+            tr, title=f"{track.name} — optimised dampers ({base_cfg.name})")
+        self.after(0, lambda: self._show_transient_figure(fig))
+        self.after(0, lambda: self._export_btn.config(state="normal"))
+        print("Done!  Optimised damper values are loaded into the form; "
+              "use 'Export to Assetto Corsa…' to save them.\n")
 
     # ------------------------------------------------------------------ #
     # Pipeline (runs in background thread)
@@ -333,6 +512,7 @@ class PipelineGUI(tk.Tk):
         finally:
             _sys.stdout = orig_stdout
             self.after(0, lambda: self._run_btn.config(state="normal"))
+            self.after(0, lambda: self._optimize_btn.config(state="normal"))
 
     def _pipeline_body(self):
         import optuna
@@ -345,7 +525,9 @@ class PipelineGUI(tk.Tk):
         from track import Track
         from vehicle_model import NCMiata
         from analysis import (LapResult, compare_figure, laptime_bar_figure,
-                              gforce_figure, corner_speed_figure)
+                              gforce_figure, corner_speed_figure,
+                              build_lap_channels, lap_summary,
+                              gg_diagram_figure, channels_figure)
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -387,28 +569,44 @@ class PipelineGUI(tk.Tk):
 
         self._export_cfg = opt_cfg
 
-        fig_cmp = compare_figure(base_res, opt_res)
-        fig_bar = laptime_bar_figure([base_res, opt_res])
-        fig_g = gforce_figure(base_res, opt_res)
+        # Channel data for the optimised setup
+        opt_car = NCMiata(opt_cfg)
+        ch_df = build_lap_channels(opt_res, opt_car)
+        smry  = lap_summary(ch_df)
+        print(f"  v_max {smry['v_max_kph']:.1f} km/h  "
+              f"| max lat g {smry['max_lat_g']:.2f}  "
+              f"| max power {smry['max_power_kW']:.1f} kW  "
+              f"| gears used {smry['gears_used']}")
+
+        fig_cmp    = compare_figure(base_res, opt_res)
+        fig_bar    = laptime_bar_figure([base_res, opt_res])
+        fig_g      = gforce_figure(base_res, opt_res)
         fig_corner = corner_speed_figure(base_res, opt_res)
-        self.after(0, lambda: self._show_figures(fig_cmp, fig_bar, fig_g, fig_corner))
+        fig_gg     = gg_diagram_figure(ch_df, label=f"{opt_cfg.name} — {track.name}")
+        fig_ch     = channels_figure(ch_df, label=f"{opt_cfg.name} — {track.name}")
+
+        self._channels_df = ch_df
+        self.after(0, lambda: self._show_figures(
+            fig_cmp, fig_bar, fig_g, fig_corner, fig_gg, fig_ch))
         self.after(0, lambda: self._export_btn.config(state="normal"))
+        self.after(0, lambda: self._export_data_btn.config(state="normal"))
         print("Done!\n")
 
     # ------------------------------------------------------------------ #
     # Figure embedding
     # ------------------------------------------------------------------ #
 
-    def _show_figures(self, fig_cmp, fig_bar, fig_g, fig_corner):
+    def _show_figures(self, fig_cmp, fig_bar, fig_g, fig_corner,
+                      fig_gg=None, fig_ch=None):
         for tab, fig in ((self._tab_speed, fig_cmp),
                          (self._tab_bar, fig_bar),
                          (self._tab_gforce, fig_g),
                          (self._tab_corner, fig_corner)):
-            for widget in tab.winfo_children():
-                widget.destroy()
-            canvas = FigureCanvasTkAgg(fig, master=tab)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            self._embed_figure(tab, fig)
+        if fig_gg is not None:
+            self._embed_figure(self._tab_gg, fig_gg)
+        if fig_ch is not None:
+            self._embed_figure(self._tab_channels, fig_ch)
 
         # Switch to the speed-trace tab
         self._notebook.select(self._tab_speed)
@@ -453,7 +651,23 @@ class _QueueWriter:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _enable_high_dpi():
+    """On Windows, make the process DPI-aware so the GUI is crisp and sized
+    correctly on high-resolution / scaled displays. No-op elsewhere."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v2
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()       # older Windows
+    except Exception:
+        pass
+
+
 def main():
+    _enable_high_dpi()
     app = PipelineGUI()
     app.mainloop()
 

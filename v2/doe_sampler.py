@@ -30,9 +30,37 @@ PARAM_NAMES = [p[0] for p in PARAM_BOUNDS]
 LOWER       = np.array([p[1] for p in PARAM_BOUNDS])
 UPPER       = np.array([p[2] for p in PARAM_BOUNDS])
 
+# --- Damper parameter space (transient-only) ---
+# (name, lower_bound, upper_bound) in N·s/m at the wheel. These are invisible
+# to the QSS solver; they only register through the 7-DOF transient model, so
+# they are swept in the *transient* DoE, not the QSS one. Ranges bracket a
+# typical NC coilover (bump 0.5–4.0 kN·s/m, rebound 1.0–6.0 kN·s/m), keeping
+# the usual rebound > bump bias reachable.
+DAMPER_PARAM_BOUNDS = [
+    ("damper_bump_f",      500,  4_000),
+    ("damper_rebound_f", 1_000,  6_000),
+    ("damper_bump_r",      500,  4_000),
+    ("damper_rebound_r", 1_000,  6_000),
+]
+DAMPER_PARAM_NAMES = [p[0] for p in DAMPER_PARAM_BOUNDS]
+
+# Combined 8-parameter space used by the joint (transient) DoE/optimizer.
+TRANSIENT_PARAM_BOUNDS = PARAM_BOUNDS + DAMPER_PARAM_BOUNDS
+TRANSIENT_PARAM_NAMES  = [p[0] for p in TRANSIENT_PARAM_BOUNDS]
+TRANSIENT_LOWER = np.array([p[1] for p in TRANSIENT_PARAM_BOUNDS])
+TRANSIENT_UPPER = np.array([p[2] for p in TRANSIENT_PARAM_BOUNDS])
+
+# Bounds keyed by name (convenient for Optuna suggest_float).
+PARAM_RANGE = {p[0]: (p[1], p[2]) for p in TRANSIENT_PARAM_BOUNDS}
+
 # ── Unit conversion ──────────────────────────────────────────────────────────
 # 1 kgf/mm = 9.81 N/mm = 9 810 N/m  (using g = 9.81 m/s²)
 N_PER_KG_MM: float = 9_810.0
+
+# Damper purchasable snap step (N·s/m at the wheel). Adjustable dampers move in
+# discrete clicks whose force mapping is nonlinear; 250 N·s/m is a pragmatic
+# "settable" increment for reporting a buildable target rather than a click count.
+_DAMPER_SNAP_SI: float = 250.0
 
 # Purchasable snap steps per parameter (kgf/mm).
 # Springs: 0.5 kgf/mm matches standard coilover-spring catalogue increments
@@ -60,6 +88,16 @@ def snap_to_buildable(params: dict) -> dict:
         step_si = _SNAP_STEPS_KG_MM.get(k, 0.5) * N_PER_KG_MM
         out[k] = round(v_si / step_si) * step_si
     return out
+
+
+def snap_dampers(params: dict) -> dict:
+    """Round damper coefficients (N·s/m) to the nearest settable increment.
+
+    Same contract as ``snap_to_buildable`` but for the damper params, which
+    live in N·s/m rather than kgf/mm. Keys not in *params* are ignored.
+    """
+    return {k: round(v / _DAMPER_SNAP_SI) * _DAMPER_SNAP_SI
+            for k, v in params.items()}
 
 
 def run_lhs_sweep(n_samples: int = 200, track: Track = None, seed: int = 42,
@@ -99,6 +137,45 @@ def run_lhs_sweep(n_samples: int = 200, track: Track = None, seed: int = 42,
 
     df = pd.DataFrame(rows)
     return df
+
+
+def run_transient_doe(n_samples: int = 120, track: Track = None, seed: int = 43,
+                      base_cfg: VehicleConfig = None, n_laps: int = 2,
+                      max_step: float = 0.02) -> pd.DataFrame:
+    """LHS sweep over all 8 params (springs/ARBs + dampers) recording the
+    transient penalty ``delta`` for each setup.
+
+    Unlike :func:`run_lhs_sweep` (which targets the QSS lap time and is blind to
+    dampers), this drives the 7-DOF coupling so dampers register. It is far more
+    expensive (~tens of seconds per sample), so ``n_laps``/``max_step`` default
+    to a faster-but-coarser transient integration than the analysis defaults.
+    Returns a DataFrame of the 8 parameters + ``delta`` (the penalty, in s).
+    """
+    from vehicle_model import NCMiata
+    from transient_lap import run_transient_lap
+
+    if track is None:
+        track = Track()
+    if base_cfg is None:
+        base_cfg = VehicleConfig()
+
+    sampler = LatinHypercube(d=len(TRANSIENT_PARAM_BOUNDS), seed=seed)
+    unit_samples = sampler.random(n=n_samples)
+    samples = scale(unit_samples, l_bounds=TRANSIENT_LOWER, u_bounds=TRANSIENT_UPPER)
+
+    rows = []
+    for i, params in enumerate(samples):
+        cfg = replace(base_cfg, **dict(zip(TRANSIENT_PARAM_NAMES, params)))
+        res = run_transient_lap(NCMiata(cfg), track, n_laps=n_laps, max_step=max_step)
+
+        row = dict(zip(TRANSIENT_PARAM_NAMES, params))
+        row["delta"] = res.delta
+        rows.append(row)
+
+        if (i + 1) % 10 == 0:
+            print(f"  Completed {i + 1}/{n_samples} transient DoE runs...")
+
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":

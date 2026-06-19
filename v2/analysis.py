@@ -84,6 +84,241 @@ class LapResult:
         return ax / 9.81
 
 
+def build_lap_channels(result: LapResult, vehicle) -> "pd.DataFrame":
+    """Build a per-point telemetry DataFrame (OptimumLap-style channels).
+
+    Parameters
+    ----------
+    result:
+        A solved :class:`LapResult` (call ``LapResult.from_sim`` first).
+    vehicle:
+        The :class:`~vehicle_model.NCMiata` instance used for the simulation.
+
+    Returns
+    -------
+    pandas.DataFrame with columns:
+
+    ``distance_m``, ``time_s``, ``speed_ms``, ``speed_kph``,
+    ``lat_accel_g``, ``long_accel_g``, ``combined_g``,
+    ``corner_radius_m``,
+    ``gear``, ``engine_rpm``, ``engine_torque_Nm``,
+    ``engine_power_kW``, ``engine_power_hp``,
+    ``wheel_tractive_force_N``, ``drag_force_N``,
+    ``rolling_resistance_N``, ``downforce_N``,
+    ``lat_grip_used_pct``,
+    ``driver_state``  (``"accelerating"`` / ``"braking"`` / ``"cornering"``).
+    """
+    import pandas as pd
+
+    v   = result.v
+    s   = result.s
+    ds  = result.ds
+    kap = result.curvature
+
+    # --- time integration (matches solver) --------------------------------
+    v_prev = np.roll(v, 1)
+    if not result.closed:
+        v_prev[0] = v[0]
+    v_avg   = np.maximum(0.5 * (v + v_prev), 1e-3)
+    cum_t   = np.cumsum(ds / v_avg)
+
+    # --- longitudinal / lateral accelerations [g] -------------------------
+    ax_raw  = (v * v - v_prev * v_prev) / (2.0 * np.maximum(ds, 1e-6))
+    long_g  = ax_raw / 9.81
+    lat_g   = v * v * np.abs(kap) / 9.81
+    comb_g  = np.sqrt(long_g ** 2 + lat_g ** 2)
+
+    # --- corner radius (cap at 5 km on near-straights) --------------------
+    radius  = np.where(np.abs(kap) > 1e-6, 1.0 / np.abs(kap), 5000.0)
+
+    # --- engine / driveline channels (vectorised) -------------------------
+    eng = vehicle.engine_state(v)
+
+    # --- resistive forces -------------------------------------------------
+    drag    = np.array([vehicle.drag_force(vi)         for vi in v])
+    df_aero = np.array([vehicle.downforce(vi)          for vi in v])
+    rr      = np.full(len(v), vehicle.rolling_resistance())
+
+    # --- lateral grip utilisation [%] ------------------------------------
+    ay_max  = vehicle.max_lat_accel(v)
+    lat_pct = np.where(ay_max > 0, np.minimum(lat_g * 9.81 / ay_max, 1.0) * 100, 0.0)
+
+    # --- driver state (discrete) ------------------------------------------
+    accel_thresh = 0.05   # [g]  above this → on throttle
+    brake_thresh = -0.10  # [g]  below this → braking
+    state = np.where(
+        long_g > accel_thresh, "accelerating",
+        np.where(long_g < brake_thresh, "braking", "cornering")
+    )
+
+    return pd.DataFrame({
+        "distance_m":           s,
+        "time_s":               cum_t,
+        "speed_ms":             v,
+        "speed_kph":            v * 3.6,
+        "lat_accel_g":          lat_g,
+        "long_accel_g":         long_g,
+        "combined_g":           comb_g,
+        "corner_radius_m":      radius,
+        "gear":                 eng["gear"],
+        "engine_rpm":           eng["rpm"],
+        "engine_torque_Nm":     eng["torque_Nm"],
+        "engine_power_kW":      eng["power_kW"],
+        "engine_power_hp":      eng["power_kW"] * 1.341,
+        "wheel_tractive_force_N": eng["wheel_force_N"],
+        "drag_force_N":         drag,
+        "rolling_resistance_N": rr,
+        "downforce_N":          df_aero,
+        "lat_grip_used_pct":    lat_pct,
+        "driver_state":         state,
+    })
+
+
+def lap_summary(df: "pd.DataFrame") -> dict:
+    """Headline statistics from a :func:`build_lap_channels` DataFrame."""
+    total_dist = float(df["distance_m"].iloc[-1])
+    total_time = float(df["time_s"].iloc[-1])
+
+    by_state = df.groupby("driver_state")["distance_m"]
+    def _pct(key):
+        if key in by_state.groups:
+            span = float(by_state.get_group(key).iloc[-1] -
+                         by_state.get_group(key).iloc[0]) if len(
+                by_state.get_group(key)) > 1 else float(
+                df.loc[df["driver_state"] == key, "speed_ms"].count())
+            # simpler: fraction of *points* in each state
+        return float((df["driver_state"] == key).mean() * 100.0)
+
+    return {
+        "lap_time_s":       total_time,
+        "distance_m":       total_dist,
+        "v_max_kph":        float(df["speed_kph"].max()),
+        "v_min_kph":        float(df["speed_kph"].min()),
+        "v_avg_kph":        float(df["speed_kph"].mean()),
+        "max_lat_g":        float(df["lat_accel_g"].max()),
+        "max_accel_g":      float(df["long_accel_g"].max()),
+        "max_brake_g":      float(-df["long_accel_g"].min()),
+        "max_combined_g":   float(df["combined_g"].max()),
+        "max_rpm":          float(df["engine_rpm"].max()),
+        "max_power_kW":     float(df["engine_power_kW"].max()),
+        "max_power_hp":     float(df["engine_power_hp"].max()),
+        "gears_used":       sorted(df["gear"].unique().tolist()),
+        "pct_accelerating": _pct("accelerating"),
+        "pct_braking":      _pct("braking"),
+        "pct_cornering":    _pct("cornering"),
+    }
+
+
+def gg_diagram_figure(df: "pd.DataFrame", label: str = ""):
+    """G-G diagram: lateral vs longitudinal acceleration scatter, coloured by
+    speed.  A unit friction-circle (combined_g = 1 g) is overlaid as a visual
+    reference.  Returns the Matplotlib ``Figure``."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    sc = ax.scatter(
+        df["lat_accel_g"], df["long_accel_g"],
+        c=df["speed_kph"], cmap="plasma", s=4, alpha=0.7,
+        vmin=df["speed_kph"].min(), vmax=df["speed_kph"].max()
+    )
+    cb = fig.colorbar(sc, ax=ax, pad=0.02)
+    cb.set_label("Speed [km/h]", fontsize=9)
+
+    # mirror for left/right corners
+    ax.scatter(
+        -df["lat_accel_g"], df["long_accel_g"],
+        c=df["speed_kph"], cmap="plasma", s=4, alpha=0.7,
+        vmin=df["speed_kph"].min(), vmax=df["speed_kph"].max()
+    )
+
+    # friction-circle envelope
+    theta = np.linspace(0, 2 * np.pi, 300)
+    ax.plot(np.cos(theta), np.sin(theta), "k--", lw=0.8, alpha=0.4,
+            label="1 g friction circle")
+
+    ax.axhline(0, color="k", lw=0.6)
+    ax.axvline(0, color="k", lw=0.6)
+    ax.set_xlabel("Lateral acceleration [g]")
+    ax.set_ylabel("Longitudinal acceleration [g]\n(+ accel / − brake)")
+    title = f"G-G diagram  —  {label}" if label else "G-G diagram"
+    ax.set_title(title, fontsize=12)
+    ax.set_aspect("equal")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def channels_figure(df: "pd.DataFrame", label: str = ""):
+    """Stacked 4-panel channel plot vs distance (OptimumLap-style).
+
+    Panels: speed (km/h), engine RPM (coloured by gear), wheel power (kW),
+    and a driver-state band (green=accel, red=brake, grey=cornering).
+    Returns the Matplotlib ``Figure``."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm
+    from matplotlib.cm import get_cmap
+
+    dist = df["distance_m"].values
+    fig, axes = plt.subplots(4, 1, figsize=(13, 9), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 2, 2, 1]})
+    title = f"Channel data  —  {label}" if label else "Channel data"
+    fig.suptitle(title, fontsize=12)
+
+    # Panel 1: speed
+    axes[0].plot(dist, df["speed_kph"], color="#1f77b4", lw=1.4)
+    axes[0].set_ylabel("Speed [km/h]")
+    axes[0].grid(True, alpha=0.25)
+
+    # Panel 2: RPM coloured by gear
+    gears = df["gear"].values
+    max_g = int(gears.max()) if len(gears) else 1
+    cmap_g = plt.cm.get_cmap("tab10", max_g)
+    for g in range(1, max_g + 1):
+        mask = gears == g
+        if mask.any():
+            axes[1].fill_between(dist, 0, df["engine_rpm"].values,
+                                 where=mask, alpha=0.5, color=cmap_g(g - 1),
+                                 label=f"Gear {g}")
+    axes[1].plot(dist, df["engine_rpm"], color="#333", lw=0.8)
+    axes[1].set_ylabel("RPM")
+    axes[1].legend(loc="upper right", fontsize=7, ncol=max_g)
+    axes[1].grid(True, alpha=0.25)
+
+    # Panel 3: power
+    axes[2].plot(dist, df["engine_power_kW"], color="#2ca02c", lw=1.4)
+    axes[2].set_ylabel("Wheel power [kW]")
+    axes[2].grid(True, alpha=0.25)
+
+    # Panel 4: driver state
+    state_colors = {"accelerating": "#2ca02c", "braking": "#d62728",
+                    "cornering": "#aaaaaa"}
+    for state, color in state_colors.items():
+        mask = df["driver_state"].values == state
+        axes[3].fill_between(dist, 0, 1, where=mask, color=color,
+                             alpha=0.8, label=state.capitalize())
+    axes[3].set_ylim(0, 1)
+    axes[3].set_yticks([])
+    axes[3].set_ylabel("Driver\nstate")
+    axes[3].set_xlabel("Distance [m]")
+    axes[3].legend(loc="upper right", fontsize=7, ncol=3)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def channels_to_csv(df: "pd.DataFrame", path: str) -> None:
+    """Write the channels DataFrame to a CSV file at *path*."""
+    df.to_csv(path, index=False)
+
+
+def channels_to_excel(df: "pd.DataFrame", path: str) -> None:
+    """Write the channels DataFrame to an Excel file at *path*
+    (requires ``openpyxl`` to be installed)."""
+    df.to_excel(path, index=False, engine="openpyxl")
+
+
 def time_delta(baseline: LapResult, optimized: LapResult) -> np.ndarray:
     """Cumulative time gained/lost by *optimized* vs *baseline* at each point.
     Negative => optimized is ahead (faster). Both must share the track mesh."""

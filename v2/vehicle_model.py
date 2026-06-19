@@ -269,6 +269,67 @@ class NCMiata:
         """Max engine tractive force at the driven wheels (N) at speed v."""
         return float(np.interp(abs(v), self._v_grid, self._F_grid))
 
+    def engine_state(self, v):
+        """Engine state at speed *v* (scalar or array): best gear, RPM,
+        engine torque (Nm), wheel power (kW), and wheel tractive force (N).
+
+        Uses the same gear-selection logic as ``_build_engine_curve`` but
+        returns the per-point breakdown rather than just the net wheel force,
+        so callers can build channel data (RPM traces, power traces, etc.)
+        without re-implementing the driveline model.
+
+        Returns a dict of same-shaped arrays (or scalars when *v* is scalar):
+        ``gear``, ``rpm``, ``torque_Nm``, ``power_kW``, ``wheel_force_N``.
+        """
+        rpm_pts = np.array([p[0] for p in self.torque_curve], dtype=float)
+        tq_pts  = np.array([p[1] for p in self.torque_curve], dtype=float)
+        rpm_min, rpm_max = rpm_pts[0], rpm_pts[-1]
+        eff = self.primary_eff * self.gear_eff * self.final_eff
+
+        scalar = np.ndim(v) == 0
+        v_arr = np.atleast_1d(np.abs(np.asarray(v, dtype=float)))
+        n = len(v_arr)
+
+        gears  = np.ones(n, dtype=int)
+        rpms   = np.full(n, rpm_min)
+        torqs  = np.zeros(n)
+        forces = np.zeros(n)
+
+        for k, vk in enumerate(v_arr):
+            best_f = 0.0
+            for g_idx, ratio in enumerate(self.gear_ratios):
+                total = ratio * self.final_drive * self.primary_ratio
+                rpm = vk / self.tyre_radius * total * 60.0 / (2.0 * np.pi)
+                if rpm > rpm_max:
+                    continue
+                tq = np.interp(max(rpm, rpm_min), rpm_pts, tq_pts)
+                f_wheel = tq * total * eff / self.tyre_radius
+                if f_wheel > best_f:
+                    best_f   = f_wheel
+                    gears[k] = g_idx + 1
+                    rpms[k]  = max(rpm, rpm_min)
+                    torqs[k] = tq
+            forces[k] = best_f
+
+        omega  = rpms * (2.0 * np.pi / 60.0)
+        powers = torqs * omega / 1000.0  # kW
+
+        if scalar:
+            return {
+                "gear":          int(gears[0]),
+                "rpm":           float(rpms[0]),
+                "torque_Nm":     float(torqs[0]),
+                "power_kW":      float(powers[0]),
+                "wheel_force_N": float(forces[0]),
+            }
+        return {
+            "gear":          gears,
+            "rpm":           rpms,
+            "torque_Nm":     torqs,
+            "power_kW":      powers,
+            "wheel_force_N": forces,
+        }
+
     def drag_force(self, v):
         """Aerodynamic drag force (N)."""
         return 0.5 * self.rho * self.cd_a * v * v
