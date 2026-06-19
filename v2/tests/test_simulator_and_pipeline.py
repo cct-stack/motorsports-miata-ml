@@ -420,3 +420,110 @@ def test_corner_speed_figure_builds(tmp_path, monza):
     out = tmp_path / "corners.png"
     fig.savefig(out)
     assert out.is_file() and out.stat().st_size > 0
+
+
+# --------------------------------------------------------------------------- #
+# Extended channels, track map, custom chart, KPI sweep (headless)
+# --------------------------------------------------------------------------- #
+from analysis import (  # noqa: E402
+    track_xy, build_lap_channels, numeric_channels,
+    track_map_figure, channel_chart_figure,
+    run_kpi_sweep, kpi_chart_figure, KPI_PARAMS, KPI_METRICS,
+)
+
+
+def _channels(cfg, track):
+    car = NCMiata(cfg)
+    return build_lap_channels(_lap_result("R", cfg, track), car)
+
+
+def test_track_xy_integrates_curvature():
+    # A constant curvature traces a circular arc: heading is linear in s and
+    # the path length matches the swept angle * radius.
+    s = np.linspace(0.0, 100.0, 201)
+    kappa = np.full_like(s, 1.0 / 25.0)        # R = 25 m
+    x, y, theta = track_xy(s, kappa)
+    assert x.shape == y.shape == theta.shape == s.shape
+    assert np.allclose(theta, kappa * s, atol=1e-3)   # theta = integral kappa ds
+    # points lie ~on the circle of radius 25 centred at (0, 25)
+    r = np.hypot(x, y - 25.0)
+    assert np.allclose(r, 25.0, atol=0.5)
+
+
+def test_build_lap_channels_new_columns(monza):
+    df = _channels(VehicleConfig(), monza)
+    for col in ("max_corner_speed_kph", "engaged_gear_ratio", "throttle_pct",
+                "brake_pct", "long_grip_used_pct", "combined_grip_used_pct",
+                "yaw_deg", "pos_x_m", "pos_y_m", "sector_index"):
+        assert col in df.columns
+    # throttle / brake are 0/100 discrete states
+    assert set(np.unique(df["throttle_pct"])) <= {0.0, 100.0}
+    assert set(np.unique(df["brake_pct"])) <= {0.0, 100.0}
+    # grip-usage percentages are bounded to [0, 100]
+    for col in ("lat_grip_used_pct", "long_grip_used_pct", "combined_grip_used_pct"):
+        assert df[col].min() >= 0.0 and df[col].max() <= 100.0 + 1e-6
+    # sectors split the lap into thirds (1..3)
+    assert set(np.unique(df["sector_index"])) <= {1, 2, 3}
+    # max corner speed never exceeds the achieved top speed
+    assert df["max_corner_speed_kph"].max() <= df["speed_kph"].max() + 1e-6
+    # the racing line spans a real 2-D extent (not degenerate)
+    assert np.ptp(df["pos_x_m"]) > 1.0 and np.ptp(df["pos_y_m"]) > 1.0
+
+
+def test_numeric_channels_excludes_driver_state(monza):
+    df = _channels(VehicleConfig(), monza)
+    cols = numeric_channels(df)
+    assert "driver_state" not in cols
+    assert "speed_kph" in cols and "pos_x_m" in cols
+
+
+def test_track_map_figure_builds(tmp_path, monza):
+    df = _channels(VehicleConfig(), monza)
+    fig = track_map_figure(df, "speed_kph", line_width=3.0, label="test")
+    # one data axis + one colour-bar axis
+    assert len(fig.axes) >= 2
+    out = tmp_path / "trackmap.png"
+    fig.savefig(out)
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_track_map_figure_bad_channel_falls_back(monza):
+    df = _channels(VehicleConfig(), monza)
+    # a non-existent channel must not raise; it falls back to speed
+    fig = track_map_figure(df, "does_not_exist")
+    assert len(fig.axes) >= 2
+
+
+def test_channel_chart_figure_line_and_scatter(tmp_path, skidpad):
+    df = _channels(VehicleConfig(), skidpad)
+    f1 = channel_chart_figure(df, "distance_m", "speed_kph", "line")
+    f2 = channel_chart_figure(df, "lat_accel_g", "long_accel_g", "scatter")
+    for k, fig in enumerate((f1, f2)):
+        out = tmp_path / f"chart{k}.png"
+        fig.savefig(out)
+        assert out.is_file() and out.stat().st_size > 0
+
+
+def test_run_kpi_sweep_mass_monotonic(skidpad):
+    cfg = VehicleConfig()
+    values = np.linspace(1000.0, 1300.0, 4)
+    sweep = run_kpi_sweep(cfg, skidpad, "mass", values)
+    assert list(sweep["mass"]) == [pytest.approx(v) for v in values]
+    for m in KPI_METRICS:
+        assert m in sweep.columns
+    # heavier car => slower lap (monotonic non-decreasing lap time)
+    assert np.all(np.diff(sweep["lap_time_s"].to_numpy()) >= -1e-6)
+
+
+def test_run_kpi_sweep_unknown_param_raises(skidpad):
+    with pytest.raises(ValueError):
+        run_kpi_sweep(VehicleConfig(), skidpad, "not_a_param", [1.0, 2.0])
+
+
+def test_kpi_chart_figure_builds(tmp_path, skidpad):
+    sweep = run_kpi_sweep(VehicleConfig(), skidpad, "mass",
+                          np.linspace(1000.0, 1300.0, 4))
+    fig = kpi_chart_figure(sweep, "mass", "lap_time_s", label="test")
+    out = tmp_path / "kpi.png"
+    fig.savefig(out)
+    assert out.is_file() and out.stat().st_size > 0

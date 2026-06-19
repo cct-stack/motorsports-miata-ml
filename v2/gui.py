@@ -156,8 +156,24 @@ class PipelineGUI(tk.Tk):
         self._tab_channels = ttk.Frame(nb)
         nb.add(self._tab_channels, text="Channels")
 
+        # Tab 8: Track map (colour-by-any-channel)
+        self._tab_trackmap = ttk.Frame(nb)
+        nb.add(self._tab_trackmap, text="Track map")
+        self._build_trackmap_tab(self._tab_trackmap)
+
+        # Tab 9: Custom chart (any X vs any Y)
+        self._tab_customchart = ttk.Frame(nb)
+        nb.add(self._tab_customchart, text="Custom chart")
+        self._build_customchart_tab(self._tab_customchart)
+
+        # Tab 10: KPI sweep (parameter sensitivity)
+        self._tab_kpi = ttk.Frame(nb)
+        nb.add(self._tab_kpi, text="KPI sweep")
+        self._build_kpi_tab(self._tab_kpi)
+
         self._notebook = nb
         self._channels_df = None   # last computed channel DataFrame
+        self._kpi_df = None        # last computed KPI sweep DataFrame
 
     def _build_car_frame(self, parent):
         frm = ttk.LabelFrame(parent, text="Car Definition", padding=6)
@@ -223,6 +239,192 @@ class PipelineGUI(tk.Tk):
         self._optimize_btn = ttk.Button(frm, text="\u2699  Optimize dampers (slow)",
                                         command=self._on_optimize_dampers)
         self._optimize_btn.grid(row=2, column=6, columnspan=2, pady=(6, 0))
+
+    # ------------------------------------------------------------------ #
+    # Data-explorer tabs (track map / custom chart / KPI sweep)
+    # ------------------------------------------------------------------ #
+
+    def _build_trackmap_tab(self, tab):
+        ctl = ttk.Frame(tab)
+        ctl.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(ctl, text="Colour by:").pack(side=tk.LEFT, padx=(0, 4))
+        self._tm_channel_var = tk.StringVar(value="speed_kph")
+        self._tm_channel_combo = ttk.Combobox(
+            ctl, textvariable=self._tm_channel_var, state="readonly", width=24)
+        self._tm_channel_combo.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ctl, text="Line width:").pack(side=tk.LEFT, padx=(0, 4))
+        self._tm_width_var = tk.StringVar(value="4")
+        ttk.Spinbox(ctl, textvariable=self._tm_width_var, from_=1, to=12,
+                    increment=1, width=5).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(ctl, text="Draw", command=self._on_draw_trackmap).pack(side=tk.LEFT)
+        self._trackmap_plot = ttk.Frame(tab)
+        self._trackmap_plot.pack(fill=tk.BOTH, expand=True)
+
+    def _build_customchart_tab(self, tab):
+        ctl = ttk.Frame(tab)
+        ctl.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(ctl, text="X:").pack(side=tk.LEFT, padx=(0, 4))
+        self._cc_x_var = tk.StringVar(value="distance_m")
+        self._cc_x_combo = ttk.Combobox(
+            ctl, textvariable=self._cc_x_var, state="readonly", width=22)
+        self._cc_x_combo.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ctl, text="Y:").pack(side=tk.LEFT, padx=(0, 4))
+        self._cc_y_var = tk.StringVar(value="speed_kph")
+        self._cc_y_combo = ttk.Combobox(
+            ctl, textvariable=self._cc_y_var, state="readonly", width=22)
+        self._cc_y_combo.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ctl, text="Type:").pack(side=tk.LEFT, padx=(0, 4))
+        self._cc_kind_var = tk.StringVar(value="line")
+        ttk.Combobox(ctl, textvariable=self._cc_kind_var, state="readonly",
+                     values=["line", "scatter"], width=8).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(ctl, text="Plot", command=self._on_draw_customchart).pack(side=tk.LEFT)
+        self._customchart_plot = ttk.Frame(tab)
+        self._customchart_plot.pack(fill=tk.BOTH, expand=True)
+
+    def _build_kpi_tab(self, tab):
+        from analysis import KPI_PARAMS, KPI_METRICS
+        ctl = ttk.Frame(tab)
+        ctl.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(ctl, text="Parameter:").pack(side=tk.LEFT, padx=(0, 4))
+        self._kpi_param_var = tk.StringVar(value="mass")
+        param_combo = ttk.Combobox(ctl, textvariable=self._kpi_param_var,
+                                   state="readonly", width=16,
+                                   values=list(KPI_PARAMS.keys()))
+        param_combo.pack(side=tk.LEFT, padx=(0, 8))
+        param_combo.bind("<<ComboboxSelected>>", self._on_kpi_param_changed)
+        ttk.Label(ctl, text="Min:").pack(side=tk.LEFT, padx=(0, 2))
+        self._kpi_min_var = tk.StringVar(value="960")
+        ttk.Entry(ctl, textvariable=self._kpi_min_var, width=9).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(ctl, text="Max:").pack(side=tk.LEFT, padx=(0, 2))
+        self._kpi_max_var = tk.StringVar(value="1300")
+        ttk.Entry(ctl, textvariable=self._kpi_max_var, width=9).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(ctl, text="Steps:").pack(side=tk.LEFT, padx=(0, 2))
+        self._kpi_steps_var = tk.StringVar(value="7")
+        ttk.Spinbox(ctl, textvariable=self._kpi_steps_var, from_=3, to=30,
+                    increment=1, width=5).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(ctl, text="Metric:").pack(side=tk.LEFT, padx=(0, 2))
+        self._kpi_metric_var = tk.StringVar(value="lap_time_s")
+        ttk.Combobox(ctl, textvariable=self._kpi_metric_var, state="readonly",
+                     width=16, values=list(KPI_METRICS.keys())).pack(side=tk.LEFT, padx=(0, 12))
+        self._kpi_btn = ttk.Button(ctl, text="Run sweep", command=self._on_run_kpi)
+        self._kpi_btn.pack(side=tk.LEFT)
+        self._kpi_plot = ttk.Frame(tab)
+        self._kpi_plot.pack(fill=tk.BOTH, expand=True)
+
+    def _on_kpi_param_changed(self, _event=None):
+        """Auto-fill the sweep min/max around the current config value."""
+        param = self._kpi_param_var.get()
+        try:
+            base = float(getattr(self._read_fields_into_cfg(), param))
+        except Exception:
+            try:
+                base = float(getattr(self._cfg, param))
+            except Exception:
+                return
+        lo, hi = (0.85 * base, 1.15 * base) if base else (0.0, 1.0)
+        self._kpi_min_var.set(f"{lo:g}")
+        self._kpi_max_var.set(f"{hi:g}")
+
+    def _populate_channel_selectors(self):
+        """Refresh the track-map / custom-chart channel lists from the latest
+        channel DataFrame, keeping any still-valid current selection."""
+        if self._channels_df is None:
+            return
+        from analysis import numeric_channels
+        cols = numeric_channels(self._channels_df)
+        if not cols:
+            return
+        self._tm_channel_combo["values"] = cols
+        self._cc_x_combo["values"] = cols
+        self._cc_y_combo["values"] = cols
+        if self._tm_channel_var.get() not in cols:
+            self._tm_channel_var.set("speed_kph" if "speed_kph" in cols else cols[0])
+        if self._cc_x_var.get() not in cols:
+            self._cc_x_var.set("distance_m" if "distance_m" in cols else cols[0])
+        if self._cc_y_var.get() not in cols:
+            self._cc_y_var.set("speed_kph" if "speed_kph" in cols else cols[-1])
+
+    def _on_draw_trackmap(self):
+        if self._channels_df is None:
+            messagebox.showinfo("No data", "Run the pipeline first to generate "
+                                "channel data, then draw the track map.")
+            return
+        from analysis import track_map_figure
+        try:
+            width = float(self._tm_width_var.get())
+        except ValueError:
+            width = 4.0
+        fig = track_map_figure(self._channels_df, self._tm_channel_var.get(),
+                               line_width=width, label=self._cfg.name)
+        self._embed_figure(self._trackmap_plot, fig)
+
+    def _on_draw_customchart(self):
+        if self._channels_df is None:
+            messagebox.showinfo("No data", "Run the pipeline first to generate "
+                                "channel data, then plot a custom chart.")
+            return
+        from analysis import channel_chart_figure
+        fig = channel_chart_figure(self._channels_df, self._cc_x_var.get(),
+                                   self._cc_y_var.get(), self._cc_kind_var.get(),
+                                   label=self._cfg.name)
+        self._embed_figure(self._customchart_plot, fig)
+
+    def _on_run_kpi(self):
+        try:
+            self._cfg = self._read_fields_into_cfg()
+        except Exception as exc:
+            messagebox.showerror("Invalid parameters", str(exc))
+            return
+        try:
+            mn = float(self._kpi_min_var.get())
+            mx = float(self._kpi_max_var.get())
+            steps = int(self._kpi_steps_var.get())
+            assert steps >= 2 and mx > mn
+        except (ValueError, AssertionError):
+            messagebox.showerror("Invalid sweep",
+                                 "Need Min < Max and Steps ≥ 2.")
+            return
+        self._kpi_btn.config(state="disabled")
+        self._log("─" * 60 + "\n")
+        thread = threading.Thread(
+            target=self._run_kpi, args=(mn, mx, steps), daemon=True)
+        thread.start()
+
+    def _run_kpi(self, mn, mx, steps):
+        import sys as _sys
+        orig_stdout = _sys.stdout
+        _sys.stdout = _QueueWriter(self._log_queue)
+        try:
+            self._kpi_body(mn, mx, steps)
+        except Exception as exc:
+            self._log_queue.put(f"\n[ERROR] {exc}\n")
+        finally:
+            _sys.stdout = orig_stdout
+            self.after(0, lambda: self._kpi_btn.config(state="normal"))
+
+    def _kpi_body(self, mn, mx, steps):
+        import numpy as np
+        from track import Track
+        from analysis import run_kpi_sweep, kpi_chart_figure
+
+        param = self._kpi_param_var.get()
+        metric = self._kpi_metric_var.get()
+        track = Track.monza() if self._track_var.get() == "monza" else Track()
+        values = np.linspace(mn, mx, steps)
+        print(f"KPI sweep  |  {self._cfg.name}  |  {track.name}")
+        print(f"  sweeping {param} over {steps} values "
+              f"[{mn:g} … {mx:g}], metric = {metric}")
+        sweep = run_kpi_sweep(self._cfg, track, param, values)
+        self._kpi_df = sweep
+        for _, r in sweep.iterrows():
+            print(f"    {param}={r[param]:.4g}  →  {metric}={r[metric]:.4g}")
+        fig = kpi_chart_figure(sweep, param, metric, label=self._cfg.name)
+        self.after(0, lambda: self._show_kpi_figure(fig))
+        print("Done!\n")
+
+    def _show_kpi_figure(self, fig):
+        self._embed_figure(self._kpi_plot, fig)
+        self._notebook.select(self._tab_kpi)
 
     # ------------------------------------------------------------------ #
     # Field helpers
@@ -394,6 +596,36 @@ class PipelineGUI(tk.Tk):
         toolbar.update()
         toolbar.pack(side=tk.TOP, fill=tk.X)
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self._enable_scroll_zoom(canvas)
+
+    @staticmethod
+    def _enable_scroll_zoom(canvas, base_scale: float = 1.2):
+        """Zoom the axes under the cursor in/out on mouse-wheel scroll,
+        keeping the point under the cursor fixed (scroll up = zoom in).
+
+        This supplements the toolbar's rectangle-zoom: just point at a
+        region and roll the wheel. ``home`` on the toolbar resets the view.
+        """
+        def _on_scroll(event):
+            ax = event.inaxes
+            if ax is None or event.xdata is None or event.ydata is None:
+                return
+            if event.button == "up":
+                scale = 1.0 / base_scale
+            elif event.button == "down":
+                scale = base_scale
+            else:
+                return
+            xdata, ydata = event.xdata, event.ydata
+            x0, x1 = ax.get_xlim()
+            y0, y1 = ax.get_ylim()
+            ax.set_xlim(xdata - (xdata - x0) * scale,
+                        xdata + (x1 - xdata) * scale)
+            ax.set_ylim(ydata - (ydata - y0) * scale,
+                        ydata + (y1 - ydata) * scale)
+            canvas.draw_idle()
+
+        canvas.mpl_connect("scroll_event", _on_scroll)
 
     def _show_transient_figure(self, fig):
         self._embed_figure(self._tab_transient, fig)
@@ -607,6 +839,14 @@ class PipelineGUI(tk.Tk):
             self._embed_figure(self._tab_gg, fig_gg)
         if fig_ch is not None:
             self._embed_figure(self._tab_channels, fig_ch)
+
+        # Refresh the data-explorer selectors and draw their default views
+        self._populate_channel_selectors()
+        try:
+            self._on_draw_trackmap()
+            self._on_draw_customchart()
+        except Exception:
+            pass
 
         # Switch to the speed-trace tab
         self._notebook.select(self._tab_speed)

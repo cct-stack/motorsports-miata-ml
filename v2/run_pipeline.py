@@ -71,6 +71,12 @@ def main(argv=None) -> int:
                    help="write per-point channel data for the optimized setup to "
                         "PATH (.csv) or PATH (.xlsx); e.g. --export-channels "
                         "channels_monza.csv")
+    p.add_argument("--track-map", default=None, metavar="CHANNEL",
+                   help="save a bird's-eye track map of the optimized setup "
+                        "coloured by CHANNEL; e.g. --track-map speed_kph")
+    p.add_argument("--kpi", default=None, metavar="PARAM:MIN:MAX:STEPS:METRIC",
+                   help="run a KPI sensitivity sweep and save a chart; e.g. "
+                        "--kpi mass:960:1300:7:lap_time_s")
     args = p.parse_args(argv)
 
     if args.no_show:
@@ -88,7 +94,8 @@ def main(argv=None) -> int:
                           gforce_figure, corner_speed_figure, summary,
                           build_lap_channels, lap_summary,
                           gg_diagram_figure, channels_figure,
-                          channels_to_csv, channels_to_excel)
+                          channels_to_csv, channels_to_excel,
+                          track_map_figure)
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -163,10 +170,14 @@ def main(argv=None) -> int:
     fig_corner.savefig(corner_png, dpi=120)
     print(f"    graphs -> {cmp_png}, {bar_png}, {g_png}, {corner_png}")
 
+    # Per-point channel data (built once; shared by export + track map)
+    ch_df = None
+    if args.export_channels or args.track_map:
+        ch_df = build_lap_channels(opt, NCMiata(opt_cfg))
+
     # Optional per-point channel export
     if args.export_channels:
         ch_path = Path(args.export_channels)
-        ch_df   = build_lap_channels(opt, NCMiata(opt_cfg))
         smry    = lap_summary(ch_df)
         print(f"[+] Channel summary — optimized setup on {track.name}:")
         print(f"    v_max {smry['v_max_kph']:.1f} km/h  |  "
@@ -191,6 +202,14 @@ def main(argv=None) -> int:
         fig_ch.savefig(ch_png, dpi=120)
         print(f"    figures -> {gg_png}, {ch_png}")
 
+    # Optional track map coloured by a channel
+    if args.track_map:
+        fig_tm = track_map_figure(ch_df, args.track_map,
+                                  label=f"{opt_cfg.name} — {track.name}")
+        tm_png = outdir / f"track_map_{args.track}.png"
+        fig_tm.savefig(tm_png, dpi=120)
+        print(f"[+] Track map ({args.track_map}) -> {tm_png}")
+
     print(f"[5/5] Exporting Assetto Corsa physics -> {args.export_dir}")
     export_ac_car(opt_cfg, output_dir=args.export_dir)
 
@@ -205,6 +224,35 @@ def main(argv=None) -> int:
         tr_png = outdir / f"transient_{args.track}.png"
         fig_tr.savefig(tr_png, dpi=120)
         print(f"    report -> {tr_png}")
+
+    # Optional KPI sensitivity sweep
+    if args.kpi:
+        import numpy as np
+        from analysis import (run_kpi_sweep, kpi_chart_figure,
+                              KPI_PARAMS, KPI_METRICS)
+        try:
+            pname, pmin, pmax, psteps, pmetric = args.kpi.split(":")
+            values = np.linspace(float(pmin), float(pmax), int(psteps))
+        except ValueError:
+            print(f"[!] --kpi must be PARAM:MIN:MAX:STEPS:METRIC, got {args.kpi!r}")
+            return 2
+        if pname not in KPI_PARAMS:
+            print(f"[!] unknown KPI parameter {pname!r}; choose from "
+                  f"{', '.join(KPI_PARAMS)}")
+            return 2
+        if pmetric not in KPI_METRICS:
+            print(f"[!] unknown KPI metric {pmetric!r}; choose from "
+                  f"{', '.join(KPI_METRICS)}")
+            return 2
+        print(f"[+] KPI sweep: {pname} over {len(values)} values "
+              f"[{values[0]:g} … {values[-1]:g}], metric {pmetric}...")
+        sweep = run_kpi_sweep(base_cfg, track, pname, values)
+        for _, r in sweep.iterrows():
+            print(f"    {pname}={r[pname]:.4g}  →  {pmetric}={r[pmetric]:.4g}")
+        fig_kpi = kpi_chart_figure(sweep, pname, pmetric, label=base_cfg.name)
+        kpi_png = outdir / f"kpi_{pname}_{pmetric}_{args.track}.png"
+        fig_kpi.savefig(kpi_png, dpi=120)
+        print(f"    chart -> {kpi_png}")
 
     if not args.no_show:
         import matplotlib.pyplot as plt

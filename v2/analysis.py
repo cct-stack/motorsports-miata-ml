@@ -100,12 +100,14 @@ def build_lap_channels(result: LapResult, vehicle) -> "pd.DataFrame":
 
     ``distance_m``, ``time_s``, ``speed_ms``, ``speed_kph``,
     ``lat_accel_g``, ``long_accel_g``, ``combined_g``,
-    ``corner_radius_m``,
-    ``gear``, ``engine_rpm``, ``engine_torque_Nm``,
+    ``corner_radius_m``, ``max_corner_speed_kph``,
+    ``gear``, ``engaged_gear_ratio``, ``engine_rpm``, ``engine_torque_Nm``,
     ``engine_power_kW``, ``engine_power_hp``,
     ``wheel_tractive_force_N``, ``drag_force_N``,
     ``rolling_resistance_N``, ``downforce_N``,
-    ``lat_grip_used_pct``,
+    ``throttle_pct``, ``brake_pct``,
+    ``lat_grip_used_pct``, ``long_grip_used_pct``, ``combined_grip_used_pct``,
+    ``yaw_deg``, ``pos_x_m``, ``pos_y_m``, ``sector_index``,
     ``driver_state``  (``"accelerating"`` / ``"braking"`` / ``"cornering"``).
     """
     import pandas as pd
@@ -139,17 +141,54 @@ def build_lap_channels(result: LapResult, vehicle) -> "pd.DataFrame":
     df_aero = np.array([vehicle.downforce(vi)          for vi in v])
     rr      = np.full(len(v), vehicle.rolling_resistance())
 
-    # --- lateral grip utilisation [%] ------------------------------------
+    # --- grip utilisation: lateral / longitudinal / combined [%] ----------
     ay_max  = vehicle.max_lat_accel(v)
     lat_pct = np.where(ay_max > 0, np.minimum(lat_g * 9.81 / ay_max, 1.0) * 100, 0.0)
+    long_pct = np.where(ay_max > 0,
+                        np.minimum(np.abs(long_g) * 9.81 / ay_max, 1.0) * 100, 0.0)
+    comb_pct = np.where(ay_max > 0,
+                        np.minimum(comb_g * 9.81 / ay_max, 1.0) * 100, 0.0)
 
-    # --- driver state (discrete) ------------------------------------------
+    # --- maximum cornering speed from the lateral-grip envelope -----------
+    # v_corner solves  v^2 * |kappa| = ay_max(v)  (fixed-point; downforce
+    # makes ay_max speed-dependent). Straights are capped at the lap's vmax.
+    absk     = np.abs(kap)
+    vmax     = float(np.max(v)) if len(v) else 0.0
+    v_corner = np.full(len(v), vmax, dtype=float)
+    corner_mask = absk > 1e-6
+    if corner_mask.any():
+        vc = np.asarray(v, dtype=float)[corner_mask].copy()
+        kk = absk[corner_mask]
+        for _ in range(8):
+            vc = np.sqrt(np.maximum(vehicle.max_lat_accel(vc), 0.0) / kk)
+        v_corner[corner_mask] = vc
+    # clamp to the lap's achieved top speed (straights have no lateral limit)
+    v_corner = np.minimum(v_corner, vmax)
+
+    # --- driver state (discrete) + throttle / brake position --------------
     accel_thresh = 0.05   # [g]  above this → on throttle
     brake_thresh = -0.10  # [g]  below this → braking
     state = np.where(
         long_g > accel_thresh, "accelerating",
         np.where(long_g < brake_thresh, "braking", "cornering")
     )
+    throttle = np.where(state == "accelerating", 100.0, 0.0)
+    brake    = np.where(state == "braking", 100.0, 0.0)
+
+    # --- track geometry: heading + (x, y) racing-line position ------------
+    pos_x, pos_y, theta = track_xy(s, kap)
+    yaw_deg = np.degrees(theta)
+
+    # --- driveline: overall engaged gear ratio ----------------------------
+    ratios = np.asarray(vehicle.gear_ratios, dtype=float)
+    g_idx  = np.clip(np.asarray(eng["gear"], dtype=int) - 1, 0, len(ratios) - 1)
+    overall_ratio = (ratios[g_idx] * vehicle.final_drive * vehicle.primary_ratio)
+
+    # --- sector index (track split into thirds by distance) ---------------
+    n_sectors = 3
+    total_s   = float(s[-1]) if len(s) else 1.0
+    sector    = np.minimum(
+        (s / max(total_s, 1e-9) * n_sectors).astype(int) + 1, n_sectors)
 
     return pd.DataFrame({
         "distance_m":           s,
@@ -160,7 +199,9 @@ def build_lap_channels(result: LapResult, vehicle) -> "pd.DataFrame":
         "long_accel_g":         long_g,
         "combined_g":           comb_g,
         "corner_radius_m":      radius,
+        "max_corner_speed_kph": v_corner * 3.6,
         "gear":                 eng["gear"],
+        "engaged_gear_ratio":   overall_ratio,
         "engine_rpm":           eng["rpm"],
         "engine_torque_Nm":     eng["torque_Nm"],
         "engine_power_kW":      eng["power_kW"],
@@ -169,9 +210,44 @@ def build_lap_channels(result: LapResult, vehicle) -> "pd.DataFrame":
         "drag_force_N":         drag,
         "rolling_resistance_N": rr,
         "downforce_N":          df_aero,
+        "throttle_pct":         throttle,
+        "brake_pct":            brake,
         "lat_grip_used_pct":    lat_pct,
+        "long_grip_used_pct":   long_pct,
+        "combined_grip_used_pct": comb_pct,
+        "yaw_deg":              yaw_deg,
+        "pos_x_m":              pos_x,
+        "pos_y_m":              pos_y,
+        "sector_index":         sector,
         "driver_state":         state,
     })
+
+
+def track_xy(s, curvature, closed: bool = False):
+    """Integrate a curvature-vs-distance track into an (x, y) centre-line.
+
+    Heading is the running integral of curvature along the path,
+    ``theta(s) = ∫ kappa ds``; position then follows from
+    ``x = ∫ cos(theta) ds``, ``y = ∫ sin(theta) ds`` (trapezoidal). Returns
+    ``(x, y, theta)`` as arrays the same length as *s*. This is enough to draw
+    a recognisable track map even though the solver only stores curvature.
+    """
+    s   = np.asarray(s, dtype=float)
+    kap = np.asarray(curvature, dtype=float)
+    if len(s) < 2:
+        z = np.zeros(len(s))
+        return z, z.copy(), z.copy()
+    ds = np.diff(s)
+    # heading via trapezoidal integration of curvature
+    dtheta = 0.5 * (kap[1:] + kap[:-1]) * ds
+    theta  = np.concatenate(([0.0], np.cumsum(dtheta)))
+    # position via mid-segment heading
+    th_mid = 0.5 * (theta[1:] + theta[:-1])
+    dx = np.cos(th_mid) * ds
+    dy = np.sin(th_mid) * ds
+    x  = np.concatenate(([0.0], np.cumsum(dx)))
+    y  = np.concatenate(([0.0], np.cumsum(dy)))
+    return x, y, theta
 
 
 def lap_summary(df: "pd.DataFrame") -> dict:
@@ -216,7 +292,7 @@ def gg_diagram_figure(df: "pd.DataFrame", label: str = ""):
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(7, 7), layout="constrained")
     sc = ax.scatter(
         df["lat_accel_g"], df["long_accel_g"],
         c=df["speed_kph"], cmap="plasma", s=4, alpha=0.7,
@@ -246,7 +322,6 @@ def gg_diagram_figure(df: "pd.DataFrame", label: str = ""):
     ax.set_aspect("equal")
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(True, alpha=0.25)
-    fig.tight_layout()
     return fig
 
 
@@ -262,7 +337,8 @@ def channels_figure(df: "pd.DataFrame", label: str = ""):
 
     dist = df["distance_m"].values
     fig, axes = plt.subplots(4, 1, figsize=(13, 9), sharex=True,
-                             gridspec_kw={"height_ratios": [3, 2, 2, 1]})
+                             gridspec_kw={"height_ratios": [3, 2, 2, 1]},
+                             layout="constrained")
     title = f"Channel data  —  {label}" if label else "Channel data"
     fig.suptitle(title, fontsize=12)
 
@@ -304,7 +380,6 @@ def channels_figure(df: "pd.DataFrame", label: str = ""):
     axes[3].set_xlabel("Distance [m]")
     axes[3].legend(loc="upper right", fontsize=7, ncol=3)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig
 
 
@@ -317,6 +392,207 @@ def channels_to_excel(df: "pd.DataFrame", path: str) -> None:
     """Write the channels DataFrame to an Excel file at *path*
     (requires ``openpyxl`` to be installed)."""
     df.to_excel(path, index=False, engine="openpyxl")
+
+
+# Human-readable axis labels (with units) for the telemetry channels. Any
+# numeric column missing from here falls back to its raw column name.
+CHANNEL_LABELS: Dict[str, str] = {
+    "distance_m":           "Distance [m]",
+    "time_s":               "Time [s]",
+    "speed_ms":             "Speed [m/s]",
+    "speed_kph":            "Speed [km/h]",
+    "lat_accel_g":          "Lateral acceleration [g]",
+    "long_accel_g":         "Longitudinal acceleration [g]",
+    "combined_g":           "Combined acceleration [g]",
+    "corner_radius_m":      "Corner radius [m]",
+    "max_corner_speed_kph": "Max corner speed [km/h]",
+    "gear":                 "Gear",
+    "engaged_gear_ratio":   "Engaged gear ratio",
+    "engine_rpm":           "Engine speed [rpm]",
+    "engine_torque_Nm":     "Engine torque [Nm]",
+    "engine_power_kW":      "Wheel power [kW]",
+    "engine_power_hp":      "Wheel power [hp]",
+    "wheel_tractive_force_N": "Tractive force [N]",
+    "drag_force_N":         "Drag force [N]",
+    "rolling_resistance_N": "Rolling resistance [N]",
+    "downforce_N":          "Downforce [N]",
+    "throttle_pct":         "Throttle [%]",
+    "brake_pct":            "Brake [%]",
+    "lat_grip_used_pct":    "Lateral grip used [%]",
+    "long_grip_used_pct":   "Longitudinal grip used [%]",
+    "combined_grip_used_pct": "Combined grip used [%]",
+    "yaw_deg":              "Yaw angle [deg]",
+    "pos_x_m":              "Position X [m]",
+    "pos_y_m":              "Position Y [m]",
+    "sector_index":         "Sector",
+}
+
+
+def channel_label(col: str) -> str:
+    """Pretty axis label (with unit) for a channel column."""
+    return CHANNEL_LABELS.get(col, col)
+
+
+def numeric_channels(df: "pd.DataFrame") -> List[str]:
+    """Names of the plottable (numeric) channels in *df*, in column order."""
+    return [c for c in df.columns
+            if c != "driver_state" and np.issubdtype(df[c].dtype, np.number)]
+
+
+def track_map_figure(df: "pd.DataFrame", channel: str = "speed_kph",
+                     line_width: float = 4.0, label: str = ""):
+    """Bird's-eye track map (the ``pos_x_m`` / ``pos_y_m`` racing line) drawn as
+    a ``LineCollection`` coloured by *channel*. Returns the Matplotlib
+    ``Figure``. The colour scale carries a labelled colour-bar legend."""
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    if channel not in df.columns or not np.issubdtype(df[channel].dtype, np.number):
+        channel = "speed_kph"
+
+    x = df["pos_x_m"].to_numpy(dtype=float)
+    y = df["pos_y_m"].to_numpy(dtype=float)
+    c = df[channel].to_numpy(dtype=float)
+
+    pts = np.column_stack([x, y]).reshape(-1, 1, 2)
+    segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+    cseg = 0.5 * (c[:-1] + c[1:])
+
+    fig, ax = plt.subplots(figsize=(8, 8), layout="constrained")
+    lc = LineCollection(segs, cmap="viridis", linewidth=line_width)
+    lc.set_array(cseg)
+    line = ax.add_collection(lc)
+
+    cb = fig.colorbar(line, ax=ax, pad=0.02)
+    cb.set_label(channel_label(channel), fontsize=9)
+
+    pad = 0.05 * max(np.ptp(x), np.ptp(y), 1.0)
+    ax.set_xlim(x.min() - pad, x.max() + pad)
+    ax.set_ylim(y.min() - pad, y.max() + pad)
+    ax.set_aspect("equal")
+    ax.set_xlabel("X [m]")
+    ax.set_ylabel("Y [m]")
+    title = f"Track map — {channel_label(channel)}"
+    if label:
+        title += f"  ({label})"
+    ax.set_title(title, fontsize=12)
+    ax.grid(True, alpha=0.2)
+    return fig
+
+
+def channel_chart_figure(df: "pd.DataFrame", x_col: str = "distance_m",
+                         y_col: str = "speed_kph", kind: str = "line",
+                         label: str = ""):
+    """Configurable X-vs-Y chart of any two channels. *kind* is ``"line"`` or
+    ``"scatter"``. Returns the Matplotlib ``Figure``."""
+    import matplotlib.pyplot as plt
+
+    if x_col not in df.columns:
+        x_col = "distance_m"
+    if y_col not in df.columns:
+        y_col = "speed_kph"
+
+    x = df[x_col].to_numpy()
+    y = df[y_col].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(11, 6), layout="constrained")
+    if kind == "scatter":
+        ax.scatter(x, y, s=6, alpha=0.6, color="#1f77b4")
+    else:
+        ax.plot(x, y, lw=1.4, color="#1f77b4")
+    ax.set_xlabel(channel_label(x_col))
+    ax.set_ylabel(channel_label(y_col))
+    title = f"{channel_label(y_col)} vs {channel_label(x_col)}"
+    if label:
+        title += f"  —  {label}"
+    ax.set_title(title, fontsize=12)
+    ax.grid(True, alpha=0.25)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# KPI sensitivity sweep
+# ---------------------------------------------------------------------------
+
+# Sweepable VehicleConfig fields (those that actually change the QSS lap) with
+# human-readable labels. Used as the X axis of a KPI chart.
+KPI_PARAMS: Dict[str, str] = {
+    "mass":          "Mass [kg]",
+    "cg_height":     "CG height [m]",
+    "weight_dist_f": "Front weight dist [frac]",
+    "spring_k_f":    "Front spring rate [N/m]",
+    "spring_k_r":    "Rear spring rate [N/m]",
+    "arb_k_f":       "Front ARB rate [N/m]",
+    "arb_k_r":       "Rear ARB rate [N/m]",
+    "cl_a":          "Downforce Cl·A",
+    "cd_a":          "Drag Cd·A",
+    "aero_balance_f": "Aero balance front [frac]",
+    "final_drive":   "Final drive ratio",
+    "tyre_radius":   "Tyre radius [m]",
+    "Cr":            "Rolling resistance Cr",
+}
+
+# KPI metrics (computed from lap_summary) usable as the Y axis of a KPI chart.
+KPI_METRICS: Dict[str, str] = {
+    "lap_time_s":     "Lap time [s]",
+    "v_max_kph":      "Max speed [km/h]",
+    "v_avg_kph":      "Average speed [km/h]",
+    "max_lat_g":      "Max lateral [g]",
+    "max_combined_g": "Max combined [g]",
+    "max_power_kW":   "Max wheel power [kW]",
+    "pct_cornering":  "Cornering [%]",
+    "pct_braking":    "Braking [%]",
+    "pct_accelerating": "Accelerating [%]",
+}
+
+
+def run_kpi_sweep(base_cfg, track, param: str, values: Sequence[float]):
+    """Re-run the QSS lap for each value of *param* and tabulate the KPIs.
+
+    For every value in *values* a copy of *base_cfg* is made with ``param`` set
+    to that value, the lap is solved, and every metric in :data:`KPI_METRICS`
+    is recorded. Returns a ``pandas.DataFrame`` with a column named *param*
+    plus one column per KPI metric.
+    """
+    import pandas as pd
+    from dataclasses import replace as _replace
+    from simulator import LapSimulator
+    from vehicle_model import NCMiata
+
+    if param not in KPI_PARAMS:
+        raise ValueError(f"unknown KPI parameter: {param!r}")
+
+    rows = []
+    for val in values:
+        cfg = _replace(base_cfg, **{param: float(val)})
+        car = NCMiata(cfg)
+        res = LapResult.from_sim(f"{param}={val:g}", LapSimulator(car, track))
+        smry = lap_summary(build_lap_channels(res, car))
+        row = {param: float(val)}
+        row.update({m: smry[m] for m in KPI_METRICS})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def kpi_chart_figure(sweep_df: "pd.DataFrame", x_param: str,
+                     y_metric: str = "lap_time_s", label: str = ""):
+    """Plot a KPI metric vs a swept parameter from :func:`run_kpi_sweep`.
+    Returns the Matplotlib ``Figure``."""
+    import matplotlib.pyplot as plt
+
+    x = sweep_df[x_param].to_numpy()
+    y = sweep_df[y_metric].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(9, 6), layout="constrained")
+    ax.plot(x, y, "o-", color="#d62728", lw=1.6, ms=5)
+    ax.set_xlabel(KPI_PARAMS.get(x_param, x_param))
+    ax.set_ylabel(KPI_METRICS.get(y_metric, y_metric))
+    title = f"{KPI_METRICS.get(y_metric, y_metric)} vs {KPI_PARAMS.get(x_param, x_param)}"
+    if label:
+        title += f"  —  {label}"
+    ax.set_title(title, fontsize=12)
+    ax.grid(True, alpha=0.3)
+    return fig
 
 
 def time_delta(baseline: LapResult, optimized: LapResult) -> np.ndarray:
@@ -350,7 +626,7 @@ def compare_figure(baseline: LapResult, optimized: LapResult):
 
     fig, (ax_v, ax_d) = plt.subplots(
         2, 1, figsize=(11, 7), sharex=True,
-        gridspec_kw={"height_ratios": [2, 1]})
+        gridspec_kw={"height_ratios": [2, 1]}, layout="constrained")
     fig.suptitle(f"{baseline.track_name}  -  setup comparison", fontsize=13)
 
     for r, color in ((baseline, "#888888"), (optimized, "#1f77b4")):
@@ -375,7 +651,6 @@ def compare_figure(baseline: LapResult, optimized: LapResult):
     ax_d.set_title(f"Optimized gains {gain:+.3f}s over the lap "
                    f"(green = ahead)", fontsize=10)
     ax_d.grid(True, alpha=0.3)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig
 
 
@@ -411,7 +686,8 @@ def gforce_figure(baseline: LapResult, optimized: LapResult):
     the two setups. Returns the Matplotlib ``Figure``."""
     import matplotlib.pyplot as plt
 
-    fig, (ax_lat, ax_lon) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    fig, (ax_lat, ax_lon) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
+                                         layout="constrained")
     fig.suptitle(f"{baseline.track_name}  -  G-force traces", fontsize=13)
 
     for r, color in ((baseline, "#888888"), (optimized, "#1f77b4")):
@@ -426,8 +702,6 @@ def gforce_figure(baseline: LapResult, optimized: LapResult):
     ax_lon.set_ylabel("Longitudinal g\n(+accel / -brake)")
     ax_lon.set_xlabel("Distance [m]")
     ax_lon.grid(True, alpha=0.3)
-
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig
 
 
@@ -452,7 +726,8 @@ def corner_speed_figure(baseline: LapResult, optimized: LapResult,
     x = np.arange(len(corners))
     w = 0.4
 
-    fig, ax = plt.subplots(figsize=(max(8, len(corners) * 0.6), 5))
+    fig, ax = plt.subplots(figsize=(max(8, len(corners) * 0.6), 5),
+                           layout="constrained")
     ax.bar(x - w / 2, base_speeds, w, color="#888888", label="Baseline")
     ax.bar(x + w / 2, opt_speeds, w, color="#1f77b4", label="Optimized")
     ax.set_xticks(x)
@@ -462,7 +737,6 @@ def corner_speed_figure(baseline: LapResult, optimized: LapResult,
     ax.set_title(f"{baseline.track_name}  -  minimum speed per corner")
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
     return fig
 
 
@@ -482,7 +756,7 @@ def transient_report_figure(result, *, title: str | None = None):
     s = np.asarray(result.s, float)
     fig, (ax_v, ax_g) = plt.subplots(
         2, 1, figsize=(11, 7), sharex=True,
-        gridspec_kw={"height_ratios": [2, 1]})
+        gridspec_kw={"height_ratios": [2, 1]}, layout="constrained")
     head = title or "Damper transient analysis"
     fig.suptitle(f"{head}  —  penalty {result.delta:+.3f}s "
                  f"(QSS {result.lap_time_qss:.3f}s → "
@@ -506,7 +780,6 @@ def transient_report_figure(result, *, title: str | None = None):
     ax_g.set_xlabel("Distance [m]")
     ax_g.set_title(f"min retained grip {g.min():.3f}", fontsize=10)
     ax_g.grid(True, alpha=0.3)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
     return fig
 
 
@@ -514,7 +787,7 @@ def laptime_bar_figure(results: Sequence[LapResult]):
     """Bar chart of total lap time per setup (grouped by track)."""
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
     labels = [f"{r.label}\n{r.track_name}" for r in results]
     times = [r.lap_time for r in results]
     bars = ax.bar(labels, times, color="#1f77b4", alpha=0.8)
@@ -524,5 +797,4 @@ def laptime_bar_figure(results: Sequence[LapResult]):
     ax.set_ylabel("Lap time [s]")
     ax.set_title("Lap-time comparison")
     ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
     return fig
